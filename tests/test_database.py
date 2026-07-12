@@ -77,6 +77,52 @@ def test_save_messages_and_attachments(db):
     assert att["filename"] == "file.png"
 
 
+def test_save_reactions_with_owners(db):
+    messages = [
+        {
+            "id": 401, "channel_id": 10, "author_id": 999, "content": "React to me",
+            "timestamp": "2023-01-01T00:00:00Z", "type": 0,
+            "message_reference": None, "is_pinned": 0, "extra_data": None,
+            "custom_display_name": None, "custom_avatar_url": None,
+            "reactions": [
+                {"emoji_id": None, "emoji_name": "👍", "count": 2,
+                 "user_ids": ["111", "222"]},
+                {"emoji_id": "555", "emoji_name": "custom", "count": 1,
+                 "user_ids": ["333"]},
+            ],
+        }
+    ]
+    db.save_messages_batch(messages)
+
+    # Single-message read path
+    msg = db.get_message_with_relations(401)
+    reas = sorted(msg["reactions"], key=lambda r: r["count"])
+    assert reas[0]["user_ids"] == [333]
+    assert reas[1]["emoji_name"] == "👍"
+    assert reas[1]["user_ids"] == [111, 222]
+
+    # Paged read path decodes user_ids too
+    page = db.get_messages_paged("10", limit=10)
+    page_reas = page[0]["reactions"]
+    assert {tuple(r["user_ids"]) for r in page_reas} == {(111, 222), (333,)}
+
+
+def test_reactions_missing_user_ids_default_empty(db):
+    # Backups predating owner capture omit user_ids entirely.
+    messages = [
+        {
+            "id": 402, "channel_id": 10, "author_id": 1, "content": "old",
+            "timestamp": "2023-01-01T00:00:00Z", "type": 0,
+            "message_reference": None, "is_pinned": 0, "extra_data": None,
+            "custom_display_name": None, "custom_avatar_url": None,
+            "reactions": [{"emoji_id": None, "emoji_name": "🔥", "count": 5}],
+        }
+    ]
+    db.save_messages_batch(messages)
+    msg = db.get_message_with_relations(402)
+    assert msg["reactions"][0]["user_ids"] == []
+
+
 def test_get_last_message_id(db):
     msgs = [
         {"id": 200, "channel_id": 10, "author_id": 1, "content": "a",

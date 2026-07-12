@@ -607,10 +607,27 @@ class DiscordExporter:
         if msg.reactions:
             for react in msg.reactions:
                 emoji = react.emoji
+
+                # Fetch the users who added this reaction. This is a separate,
+                # paginated API call per reaction, so it is best-effort: on
+                # failure we still record the emoji and count.
+                reactor_ids = []
+                try:
+                    async for user in react.users():
+                        reactor_ids.append(str(user.id))
+                        # Resolve to Member (when cached) so role data is captured,
+                        # mirroring author handling above.
+                        reactor = self.member_cache.get(user.id, user)
+                        u_react = await self._format_user(reactor, is_webhook=False)
+                        if u_react: new_users.append(u_react)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch reaction users for message {msg.id}: {e}")
+
                 reactions.append({
                     "emoji_id": emoji.id if hasattr(emoji, "id") else None,
                     "emoji_name": emoji.name if hasattr(emoji, "name") else str(emoji),
-                    "count": react.count
+                    "count": react.count,
+                    "user_ids": reactor_ids
                 })
 
         # 5. Message data

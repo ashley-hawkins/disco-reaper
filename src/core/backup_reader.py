@@ -595,11 +595,21 @@ class BackupPartialEmoji:
 class BackupReaction:
     """Minimal stand-in for discord.Reaction."""
 
-    __slots__ = ("emoji", "count")
+    __slots__ = ("emoji", "count", "user_ids")
 
     def __init__(self, data: dict):
         emoji_raw = data.get("emoji", "")
         self.count = data.get("count", 0)
+
+        # IDs of the users who added this reaction (may be empty if the backup
+        # predates reaction-owner capture, or the fetch failed during export).
+        raw_users = data.get("user_ids", [])
+        if isinstance(raw_users, str):
+            try:
+                raw_users = json.loads(raw_users)
+            except (ValueError, TypeError):
+                raw_users = []
+        self.user_ids = [parse_snowflake(u) for u in raw_users] if raw_users else []
 
         if ":" in emoji_raw and not emoji_raw.startswith("<"):
             parts = emoji_raw.split(":", 1)

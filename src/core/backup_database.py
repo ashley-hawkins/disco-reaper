@@ -106,7 +106,7 @@ class BackupDatabase:
                     elif table == "embeds":
                         conn.execute("CREATE TABLE embeds (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, title TEXT, description TEXT, url TEXT, color INTEGER, timestamp TEXT, thumbnail_url TEXT, image_url TEXT, author_name TEXT, author_url TEXT, author_icon_url TEXT, footer_text TEXT, footer_icon_url TEXT, fields TEXT)")
                     elif table == "reactions":
-                        conn.execute("CREATE TABLE reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, emoji_id INTEGER, emoji_name TEXT, count INTEGER)")
+                        conn.execute("CREATE TABLE reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, emoji_id INTEGER, emoji_name TEXT, count INTEGER, user_ids TEXT)")
                     elif table == "message_stickers":
                         conn.execute("CREATE TABLE message_stickers (message_id INTEGER, sticker_id INTEGER, name TEXT, url TEXT, format_type INTEGER, local_hash TEXT, PRIMARY KEY (message_id, sticker_id))")
                     elif table == "threads":
@@ -142,7 +142,16 @@ class BackupDatabase:
                 if "type" not in col_names:
                     logger.info("Migrating users: adding type column")
                     conn.execute("ALTER TABLE users ADD COLUMN type INTEGER DEFAULT 0")
-            
+
+            # 5. Reaction Owners Migration
+            res = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='reactions'").fetchone()
+            if res and res[0] > 0:
+                cols = conn.execute("PRAGMA table_info(reactions)").fetchall()
+                col_names = [c["name"] for c in cols]
+                if "user_ids" not in col_names:
+                    logger.info("Migrating reactions: adding user_ids column")
+                    conn.execute("ALTER TABLE reactions ADD COLUMN user_ids TEXT")
+
             conn.commit()
 
     def _init_db(self):
@@ -282,7 +291,8 @@ class BackupDatabase:
                         message_id INTEGER,
                         emoji_id INTEGER,
                         emoji_name TEXT,
-                        count INTEGER
+                        count INTEGER,
+                        user_ids TEXT
                     )
                 """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(message_id)")
@@ -499,7 +509,10 @@ class BackupDatabase:
                             "message_id": msg["id"],
                             "emoji_id": parse_snowflake(rea["emoji_id"]) if rea.get("emoji_id") else None,
                             "emoji_name": rea.get("emoji_name"),
-                            "count": rea.get("count", 0)
+                            "count": rea.get("count", 0),
+                            "user_ids": json.dumps(
+                                [parse_snowflake(u) for u in (rea.get("user_ids") or [])]
+                            )
                         })
                 
                 # Stickers
@@ -545,8 +558,8 @@ class BackupDatabase:
 
             if all_reactions:
                 conn.executemany("""
-                    INSERT INTO reactions (message_id, emoji_id, emoji_name, count)
-                    VALUES (:message_id, :emoji_id, :emoji_name, :count)
+                    INSERT INTO reactions (message_id, emoji_id, emoji_name, count, user_ids)
+                    VALUES (:message_id, :emoji_id, :emoji_name, :count, :user_ids)
                 """, all_reactions)
             
             if all_stickers:
@@ -795,7 +808,7 @@ class BackupDatabase:
                 for rr in rea_rows:
                     mid = rr["message_id"]
                     if mid not in reas_by_msg: reas_by_msg[mid] = []
-                    reas_by_msg[mid].append(dict(rr))
+                    reas_by_msg[mid].append(self._reaction_row_to_dict(rr))
                 
                 st_rows = self._conn.execute(f"SELECT * FROM message_stickers WHERE message_id IN ({placeholders})", msg_ids).fetchall()
                 sts_by_msg = {}
@@ -872,7 +885,7 @@ class BackupDatabase:
                 for rr in rea_rows:
                     mid = rr["message_id"]
                     if mid not in reas_by_msg: reas_by_msg[mid] = []
-                    reas_by_msg[mid].append(dict(rr))
+                    reas_by_msg[mid].append(self._reaction_row_to_dict(rr))
                 
                 st_rows = self._conn.execute(f"SELECT * FROM message_stickers WHERE message_id IN ({placeholders})", msg_ids).fetchall()
                 sts_by_msg = {}
@@ -973,6 +986,20 @@ class BackupDatabase:
             rows = self._conn.execute("SELECT DISTINCT channel_id FROM messages").fetchall()
             return [parse_snowflake(r[0]) for r in rows if parse_snowflake(r[0])]
 
+    @staticmethod
+    def _reaction_row_to_dict(row) -> Dict[str, Any]:
+        """Converts a reactions row to a dict, decoding the JSON user_ids list."""
+        rea = dict(row)
+        raw = rea.get("user_ids")
+        if isinstance(raw, str):
+            try:
+                rea["user_ids"] = json.loads(raw)
+            except (ValueError, TypeError):
+                rea["user_ids"] = []
+        elif raw is None:
+            rea["user_ids"] = []
+        return rea
+
     def get_message_with_relations(self, message_id) -> Optional[Dict[str, Any]]:
         """Fetches a single message with its attachments, embeds, reactions, and stickers."""
         with self._lock:
@@ -1013,7 +1040,7 @@ class BackupDatabase:
 
             # Reactions
             reas = self._conn.execute("SELECT * FROM reactions WHERE message_id = ?", (mid,)).fetchall()
-            data["reactions"] = [dict(r) for r in reas]
+            data["reactions"] = [self._reaction_row_to_dict(r) for r in reas]
 
             # Stickers
             sts = self._conn.execute("SELECT * FROM message_stickers WHERE message_id = ?", (mid,)).fetchall()
