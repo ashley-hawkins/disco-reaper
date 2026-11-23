@@ -23,6 +23,11 @@ class DiscordReader:
     CHANNEL_TYPE_VOICE = discord.ChannelType.voice
     CHANNEL_TYPE_NEWS = discord.ChannelType.news
     CHANNEL_TYPE_FORUM = discord.ChannelType.forum
+    CHANNEL_TYPE_THREAD_PUBLIC = discord.ChannelType.public_thread
+    CHANNEL_TYPE_THREAD_PRIVATE = discord.ChannelType.private_thread
+    CHANNEL_TYPE_THREAD_ANNOUNCEMENT = discord.ChannelType.news_thread
+    # Channel types that are never read or migrated (raw Discord type values)
+    SKIPPED_CHANNEL_TYPES = frozenset({20})
 
     @staticmethod
     def find_item(iterable, **attrs):
@@ -67,6 +72,7 @@ class DiscordReader:
         
         self.guild: discord.Guild | None = None
         self.client: discord.Client | None = None
+        self._member_names: dict[int, str | None] = {}  # get_member_display_name cache
 
     def _create_client(self):
         intents = discord.Intents.default()
@@ -182,10 +188,34 @@ class DiscordReader:
         """Downloads an asset (icon, banner) into memory."""
         return await asset.read()
 
+    async def _fetch_guild_channels(self) -> list:
+        """
+        guild.fetch_channels() without the channel types in SKIPPED_CHANNEL_TYPES. discord.py raises
+        InvalidData for the whole list when it meets an unknown type (e.g. 20), so in that case the raw
+        channel list is fetched and the skipped types are dropped before conversion.
+        """
+        try:
+            channels = await self.guild.fetch_channels()
+        except discord.InvalidData:
+            from discord.channel import _guild_channel_factory
+            state = self.guild._state
+            data = await state.http.get_all_guild_channels(self.guild.id)
+            channels = []
+            for d in data:
+                if int(d.get("type", 0)) in self.SKIPPED_CHANNEL_TYPES:
+                    logger.info(f"Skipping channel {d.get('name')} ({d.get('id')}) of type {d.get('type')}")
+                    continue
+                factory, _ = _guild_channel_factory(d["type"])
+                if factory is None:
+                    raise
+                channels.append(factory(guild=self.guild, state=state, data=d))
+            return channels
+        return [c for c in channels if getattr(c.type, "value", c.type) not in self.SKIPPED_CHANNEL_TYPES]
+
     async def get_categories(self):
         if not self.guild:
             return []
-        categories = await self.guild.fetch_channels()
+        categories = await self._fetch_guild_channels()
         return [c for c in categories if isinstance(c, discord.CategoryChannel)]
 
     async def get_roles(self):
@@ -217,12 +247,37 @@ class DiscordReader:
             members.append(member)
         return members
 
+    async def get_member_display_name(self, user_id: int) -> str | None:
+        """
+        Display name for a user ID mentioned in a message (REST, cached): the server member, or the user
+        if they left. None if unknown. Needed because this reader has no gateway member cache, and
+        msg.mentions only lists users who were actually pinged.
+        """
+        user_id = int(user_id)
+        if user_id in self._member_names:
+            return self._member_names[user_id]
+        name = None
+        if self.guild:
+            try:
+                name = (await self.guild.fetch_member(user_id)).display_name
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                logger.debug(f"Could not fetch member {user_id}: {e}")
+        if name is None and self.client:
+            try:
+                name = (await self.client.fetch_user(user_id)).display_name
+            except discord.HTTPException as e:
+                logger.debug(f"Could not fetch user {user_id}: {e}")
+        self._member_names[user_id] = name
+        return name
+
     async def get_channels(self, category_id: int | None = None):
         """Yields all non-category channels."""
         if not self.guild:
             return []
         
-        channels = await self.guild.fetch_channels()
+        channels = await self._fetch_guild_channels()
         all_channels = [c for c in channels if not isinstance(c, discord.CategoryChannel)]
         
         if category_id:
@@ -233,17 +288,64 @@ class DiscordReader:
         """Returns all active threads in the guild."""
         if not self.guild:
             return []
-        return self.guild.active_threads
+        return await self.guild.active_threads()
+
+    async def get_threads(self, include_archived: bool = False) -> list[discord.Thread]:
+        """
+        Returns the guild's threads (incl. forum posts) via REST: all active threads and, with
+        include_archived, the archived public threads of every text/announcement/forum channel.
+        Archived private threads need Manage Threads, which the bot doesn't have, so they are not listed.
+        """
+        if not self.guild:
+            return []
+
+        threads: Dict[int, discord.Thread] = {t.id: t for t in await self.guild.active_threads()}
+        if include_archived:
+            for channel in await self.get_channels():
+                if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                    continue
+                try:
+                    async for thread in channel.archived_threads(limit=None):
+                        threads.setdefault(thread.id, thread)
+                except discord.Forbidden:
+                    logger.warning(f"403 Forbidden: Cannot fetch archived threads in {channel.name} ({channel.id})")
+        return list(threads.values())
+
+    async def has_archived_threads(self, channel_id: int) -> bool:
+        """True if the channel has at least one archived public thread (one request, not a full archive scan)."""
+        channel = await self.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+            return False
+        try:
+            async for _ in channel.archived_threads(limit=1):
+                return True
+        except discord.Forbidden:
+            logger.warning(f"403 Forbidden: Cannot check archived threads in {channel.name} ({channel.id})")
+        return False
 
     async def fetch_channels(self) -> list[Union[discord.TextChannel, discord.VoiceChannel, discord.CategoryChannel, discord.ForumChannel]]:
         """Async stub for discord.Guild.fetch_channels."""
         if not self.guild:
             return []
-        return await self.guild.fetch_channels()
+        return await self._fetch_guild_channels()
 
     async def get_channel(self, channel_id: int):
         """Returns a channel object."""
         return await self.client.fetch_channel(channel_id)
+
+    async def channel_exists(self, channel_id: int) -> bool | None:
+        """
+        True if the channel/thread still exists on Discord, False if Discord answers 404 (deleted),
+        None if that can't be told (no access, other errors). Callers only treat False as deleted.
+        """
+        try:
+            await self.client.fetch_channel(int(channel_id))
+            return True
+        except discord.NotFound:
+            return False
+        except Exception as e:
+            logger.debug(f"Could not check whether channel {channel_id} exists: {e}")
+            return None
 
     async def get_message(self, channel_id: int, message_id: int):
         """Returns a specific message."""

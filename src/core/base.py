@@ -21,6 +21,8 @@ class MigrationContext:
         # If caller didn't specify, fall back to config value
         self.target_platform = target_platform or config.target_platform or "fluxer"
         self.state = MigrationState()
+        # Message migration: False skips archived threads (set per run by the UI)
+        self.include_archived_threads = True
         
         # Apply config-based log level dynamically to the root logger
         if hasattr(self.config, "log_level") and self.config.log_level:
@@ -34,12 +36,15 @@ class MigrationContext:
             from src.core.backup_reader import BackupReader
             backup_path = self._find_backup_path(config.discord_server_id, base_dir)
             self.discord_reader = BackupReader(backup_path)
+            # Offline migration: the server structure also comes from the backup, Discord isn't contacted
+            self.sync_reader = self.discord_reader
             logger.info(f"Source mode: BACKUP — reading from {backup_path}")
         else:
             self.discord_reader = DiscordReader(
                 token=config.discord_bot_token,
                 server_id=config.discord_server_id
             )
+            self.sync_reader = self.discord_reader
             logger.info("Source mode: LIVE — using Discord API")
         
         # Build the writer for the active target platform only
@@ -163,6 +168,8 @@ class MigrationContext:
 
     async def start_connections(self):
         await self.discord_reader.start()
+        if self.sync_reader is not self.discord_reader:
+            await self.sync_reader.start()
         await self.writer.start()
 
     async def start_target_only(self):

@@ -1,0 +1,603 @@
+"""
+Message migration into real Fluxer threads.
+
+Thread messages used to be sent inline into the parent channel between "<<< THREAD >>>" / "END OF THREAD"
+markers. They now go into a Fluxer thread (created on demand, or a forum post created with its first
+message). The inline markers remain the fallback when the thread can't be created.
+"""
+import pytest
+from datetime import datetime, timezone
+from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock, MagicMock
+
+from src.core.state import MigrationState
+from src.fluxer.migrate_message import migrate_messages, migrate_global_messages, analyze_migration
+
+
+@pytest.fixture
+def state(tmp_path):
+    s = MigrationState()
+    s.set_folder("999", "ThreadTest", platform="fluxer", base_dir=tmp_path)
+    s.set_channel_mapping("11", "501")   # text channel
+    s.set_channel_mapping("13", "503")   # forum channel
+    yield s
+    s.db.close()
+
+
+def _reader(history):
+    """history: {source channel id: [messages]}"""
+    reader = MagicMock()
+    reader.db = object()       # backup-style reader: threads come from reader.threads / msg.thread
+    reader.threads = []
+    reader.guild = MagicMock()
+    reader.fetch_channels = AsyncMock(return_value=[])
+    reader.get_active_threads = AsyncMock(return_value=[])
+
+    async def fetch_message_history(channel_id, after_id=None, inclusive=False):
+        for m in history.get(int(channel_id), []):
+            if after_id is None or m.id > after_id:
+                yield m
+
+    async def fetch_global_message_history(after_id=None):
+        for m in sorted((m for msgs in history.values() for m in msgs), key=lambda m: m.id):
+            yield m
+
+    reader.fetch_message_history = fetch_message_history
+    reader.fetch_global_message_history = fetch_global_message_history
+    return reader
+
+
+def _msg(reader, id, content, thread=None, channel=None):
+    return NS(id=id, type=reader.MESSAGE_TYPE_DEFAULT, content=content, mentions=[], role_mentions=[],
+              channel_mentions=[], attachments=[], embeds=[], stickers=[], reference=None, thread=thread,
+              flags=NS(forwarded=False), author=NS(id=1, display_name="Alice", avatar=None),
+              created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), jump_url=f"https://discord/{id}",
+              channel=channel or NS(id=0))
+
+
+def _thread(id, name, parent_id, type=11, archived=False, locked=False):
+    return NS(id=id, name=name, parent_id=parent_id, type=NS(value=type), archived=archived, locked=locked,
+              auto_archive_duration=4320, slowmode_delay=0)
+
+
+def _context(state, reader, sent_ids):
+    writer = MagicMock()
+    writer.community_id = "999"
+    writer.send_message = AsyncMock(side_effect=list(sent_ids))
+    writer.send_marker = AsyncMock()
+    writer.get_channels = AsyncMock(return_value=[{"id": "501", "type": 0}, {"id": "503", "type": 15}])
+    writer.create_thread = AsyncMock(return_value="8888")
+    writer.create_thread_from_message = AsyncMock(return_value="8889")
+    writer.modify_thread = AsyncMock(return_value={})
+    return NS(discord_reader=reader, fluxer_writer=writer, state=state, is_running=True,
+              config=NS(anonymize_users=False))
+
+
+def _sends(ctx):
+    return [c.kwargs for c in ctx.fluxer_writer.send_message.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_thread_on_message_becomes_fluxer_thread_from_that_message(state):
+    thread = _thread(12, "help", parent_id=11)
+    reader = _reader({})
+    reader_history = {11: [_msg(reader, 100, "question", thread=thread)], 12: [_msg(reader, 200, "answer")]}
+    reader.fetch_message_history = _reader(reader_history).fetch_message_history
+    ctx = _context(state, reader, ["f100", "f200"])
+
+    stats = await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    ctx.fluxer_writer.create_thread_from_message.assert_awaited_once_with(
+        "501", "f100", "help", auto_archive_duration=4320, slowmode_delay=None)
+    parent_send, thread_send = _sends(ctx)
+    assert parent_send["thread_id"] is None
+    assert thread_send["channel_id"] == "501"          # the parent owns the webhook
+    assert thread_send["thread_id"] == "8889"
+    assert "THREAD" not in thread_send["content"]
+    assert thread_send["reply_to_message_id"] is None
+    ctx.fluxer_writer.send_marker.assert_not_awaited()  # no END OF THREAD marker
+    assert str(state.get_target_channel_id("12")) == "8889"
+    assert str(state.get_thread_message_id("501", "12", "200")) == "f200"
+    assert stats["messages"] == 2 and stats["threads"] == 1
+
+
+@pytest.mark.asyncio
+async def test_already_cloned_thread_is_reused(state):
+    state.set_channel_mapping("12", "7000")
+    thread = _thread(12, "help", parent_id=11)
+    reader = _reader({})
+    reader.fetch_message_history = _reader({12: [_msg(reader, 200, "answer")]}).fetch_message_history
+    ctx = _context(state, reader, ["f200"])
+
+    await migrate_messages(ctx, source_channel_id=12, target_channel_id="501", thread_id="12",
+                           thread_name="help", thread=thread)
+
+    ctx.fluxer_writer.create_thread.assert_not_awaited()
+    ctx.fluxer_writer.create_thread_from_message.assert_not_awaited()
+    assert _sends(ctx)[0]["thread_id"] == "7000"
+
+
+@pytest.mark.asyncio
+async def test_forum_post_is_created_by_its_first_message(state):
+    post = _thread(20, "Bug report", parent_id=13)
+    reader = _reader({})
+    reader.fetch_message_history = _reader({20: [_msg(reader, 20, "it broke"), _msg(reader, 21, "same here")]}).fetch_message_history
+    ctx = _context(state, reader, ["p1", "m2"])
+
+    await migrate_messages(ctx, source_channel_id=20, target_channel_id="503", thread_id="20",
+                           thread_name="Bug report", thread=post)
+
+    first, second = _sends(ctx)
+    assert (first["channel_id"], first["thread_name"], first["thread_id"]) == ("503", "Bug report", None)
+    assert (second["thread_id"], second["thread_name"]) == ("p1", None)
+    ctx.fluxer_writer.create_thread.assert_not_awaited()
+    assert str(state.get_target_channel_id("20")) == "p1"
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_inline_markers_when_thread_creation_fails(state):
+    thread = _thread(12, "help", parent_id=11)
+    reader = _reader({})
+    reader.fetch_message_history = _reader({12: [_msg(reader, 200, "answer")]}).fetch_message_history
+    ctx = _context(state, reader, ["f200"])
+    ctx.fluxer_writer.create_thread = AsyncMock(side_effect=RuntimeError("MISSING_PERMISSIONS"))
+
+    stats = await migrate_messages(ctx, source_channel_id=12, target_channel_id="501", thread_id="12",
+                                   thread_name="help", thread=thread)
+
+    send = _sends(ctx)[0]
+    assert send["thread_id"] is None
+    assert "<<< THREAD: **help** >>>" in send["content"]
+    assert stats["native_thread"] is False
+
+
+@pytest.mark.asyncio
+async def test_archived_and_locked_state_applied_after_messages(state):
+    thread = _thread(12, "old", parent_id=11, archived=True, locked=True)
+    reader = _reader({})
+    reader.fetch_message_history = _reader({12: [_msg(reader, 200, "answer")]}).fetch_message_history
+    ctx = _context(state, reader, ["f200"])
+
+    await migrate_messages(ctx, source_channel_id=12, target_channel_id="501", thread_id="12",
+                           thread_name="old", thread=thread)
+
+    ctx.fluxer_writer.modify_thread.assert_awaited_once_with("8888", archived=True, locked=True)
+    assert state.is_thread_completed("501", "12")
+
+
+@pytest.mark.asyncio
+async def test_waterfall_sends_thread_messages_into_fluxer_thread(state):
+    state.set_channel_mapping("12", "7000")
+    thread = _thread(12, "help", parent_id=11)
+    reader = _reader({})
+    reader.fetch_global_message_history = _reader({
+        11: [_msg(reader, 100, "question", channel=NS(id=11, type=NS(value=0)))],
+        12: [_msg(reader, 200, "answer", channel=thread)],
+    }).fetch_global_message_history
+    ctx = _context(state, reader, ["f100", "f200"])
+
+    stats = await migrate_global_messages(ctx)
+
+    parent_send, thread_send = _sends(ctx)
+    # the Fluxer DB returns target IDs as int; writer routes stringify them
+    assert (str(parent_send["channel_id"]), parent_send["thread_id"]) == ("501", None)
+    assert (str(thread_send["channel_id"]), thread_send["thread_id"]) == ("501", "7000")
+    assert str(state.get_thread_message_id("501", "12", "200")) == "f200"
+    assert stats["threads"] == 1
+
+
+def _forum_reader(posts, history):
+    reader = _reader(history)
+    reader.threads = posts
+    reader.CHANNEL_TYPE_FORUM = NS(value=15)
+
+    async def get_channel(channel_id):
+        return NS(id=channel_id, type=NS(value=15 if channel_id == 13 else 0))
+
+    reader.get_channel = get_channel
+    return reader
+
+
+@pytest.mark.asyncio
+async def test_forum_channel_migrates_each_post_as_thread(state):
+    """A forum has no messages of its own: each post is created on Fluxer by its first message."""
+    posts = [_thread(31, "second", parent_id=13), _thread(30, "first", parent_id=13)]
+    reader = _forum_reader(posts, {})
+    reader.fetch_message_history = _reader({
+        30: [_msg(reader, 30, "post one"), _msg(reader, 32, "reply one")],
+        31: [_msg(reader, 31, "post two")],
+    }).fetch_message_history
+    ctx = _context(state, reader, ["p30", "m32", "p31"])
+
+    stats = await migrate_messages(ctx, source_channel_id=13, target_channel_id="503")
+
+    sends = _sends(ctx)
+    assert [(s["channel_id"], s["thread_name"], s["thread_id"]) for s in sends] == [
+        ("503", "first", None), ("503", None, "p30"), ("503", "second", None)]   # oldest post first
+    ctx.fluxer_writer.send_marker.assert_not_awaited()
+    assert str(state.get_target_channel_id("30")) == "p30"
+    assert str(state.get_target_channel_id("31")) == "p31"
+    assert stats["threads"] == 2 and stats["messages"] == 3
+
+
+@pytest.mark.asyncio
+async def test_forum_resume_skips_completed_posts(state):
+    state.set_channel_mapping("30", "p30")
+    state.update_thread_completed("503", "30", completed=True)
+    posts = [_thread(30, "first", parent_id=13), _thread(31, "second", parent_id=13)]
+    reader = _forum_reader(posts, {})
+    reader.fetch_message_history = _reader({30: [_msg(reader, 30, "post one")],
+                                            31: [_msg(reader, 31, "post two")]}).fetch_message_history
+    ctx = _context(state, reader, ["p31"])
+
+    await migrate_messages(ctx, source_channel_id=13, target_channel_id="503")
+
+    assert [s["thread_name"] for s in _sends(ctx)] == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_forum_counts_posts_not_starters_twice(state):
+    from src.fluxer.migrate_message import analyze_migration
+    posts = [_thread(30, "first", parent_id=13)]
+    reader = _forum_reader(posts, {})
+    reader.fetch_message_history = _reader({13: [_msg(reader, 30, "starter via forum history")],
+                                            30: [_msg(reader, 30, "post one"), _msg(reader, 32, "reply")]}).fetch_message_history
+    ctx = _context(state, reader, [])
+
+    stats = await analyze_migration(ctx, source_channel_id=13)
+
+    assert (stats["threads"], stats["messages"]) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_thread_of_other_target_channel_is_sent_inline(state):
+    """Picker target differs from the cloned parent: Fluxer would reject thread_id, so don't create/use a thread."""
+    thread = _thread(12, "help", parent_id=11)   # cloned parent is 501
+    reader = _reader({})
+    reader.fetch_message_history = _reader({12: [_msg(reader, 200, "answer")]}).fetch_message_history
+    ctx = _context(state, reader, ["f200"])
+
+    await migrate_messages(ctx, source_channel_id=12, target_channel_id="600", thread_id="12",
+                           thread_name="help", thread=thread)
+
+    ctx.fluxer_writer.create_thread.assert_not_awaited()
+    assert _sends(ctx)[0]["thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_channel_threads_live_includes_active_posts():
+    """discord.py's Guild.active_threads is a coroutine method; it used to be iterated uncalled."""
+    from src.fluxer.migrate_message import get_channel_threads
+
+    async def archived_threads(limit=None):
+        yield NS(id=3, parent_id=13)
+
+    active = [NS(id=1, parent_id=13), NS(id=2, parent_id=99)]
+    reader = NS(guild=NS(active_threads=AsyncMock(return_value=active)),
+                get_channel=AsyncMock(return_value=NS(archived_threads=archived_threads)))
+
+    assert [t.id for t in await get_channel_threads(reader, 13)] == [1, 3]
+
+
+# -- "Include archived threads" option (context.include_archived_threads) --
+
+@pytest.mark.asyncio
+async def test_get_channel_threads_backup_can_skip_archived():
+    from src.fluxer.migrate_message import get_channel_threads
+    reader = NS(db=object(), threads=[_thread(1, "a", 13), _thread(2, "b", 13, archived=True), _thread(3, "c", 99)])
+
+    assert [t.id for t in await get_channel_threads(reader, 13)] == [1, 2]
+    assert [t.id for t in await get_channel_threads(reader, 13, include_archived=False)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_get_channel_threads_live_active_only_skips_archive_scan():
+    from src.fluxer.migrate_message import get_channel_threads
+    reader = NS(guild=NS(active_threads=AsyncMock(return_value=[NS(id=1, parent_id=13)])),
+                get_channel=AsyncMock())
+
+    assert [t.id for t in await get_channel_threads(reader, 13, include_archived=False)] == [1]
+    reader.get_channel.assert_not_awaited()   # no per-channel archive scan
+
+
+@pytest.mark.asyncio
+async def test_active_only_run_skips_archived_thread_on_message(state):
+    old = _thread(12, "old", parent_id=11, archived=True)
+    new = _thread(14, "new", parent_id=11)
+    reader = _reader({})
+    reader.fetch_message_history = _reader({
+        11: [_msg(reader, 100, "q1", thread=old), _msg(reader, 101, "q2", thread=new)],
+        12: [_msg(reader, 200, "in old")],
+        14: [_msg(reader, 300, "in new")],
+    }).fetch_message_history
+    ctx = _context(state, reader, ["f100", "f101", "f300"])
+    ctx.include_archived_threads = False
+
+    stats = await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    assert [s["content"].splitlines()[-1] for s in _sends(ctx)] == ["q1", "q2", "in new"]
+    assert stats["threads"] == 1
+    assert not state.is_thread_completed("501", "12")   # left for a later run
+
+
+@pytest.mark.asyncio
+async def test_active_only_forum_skips_archived_posts(state):
+    posts = [_thread(30, "old", parent_id=13, archived=True), _thread(31, "new", parent_id=13)]
+    reader = _forum_reader(posts, {})
+    reader.fetch_message_history = _reader({30: [_msg(reader, 30, "old post")],
+                                            31: [_msg(reader, 31, "new post")]}).fetch_message_history
+    ctx = _context(state, reader, ["p31"])
+    ctx.include_archived_threads = False
+
+    await migrate_messages(ctx, source_channel_id=13, target_channel_id="503")
+
+    assert [s["thread_name"] for s in _sends(ctx)] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_active_only_waterfall_skips_archived_thread_messages(state):
+    state.set_channel_mapping("12", "7000")
+    old = _thread(12, "old", parent_id=11, archived=True)
+    reader = _reader({})
+    reader.fetch_global_message_history = _reader({
+        11: [_msg(reader, 100, "question", channel=NS(id=11, type=NS(value=0)))],
+        12: [_msg(reader, 200, "answer", channel=old)],
+    }).fetch_global_message_history
+    ctx = _context(state, reader, ["f100"])
+    ctx.include_archived_threads = False
+
+    stats = await migrate_global_messages(ctx)
+
+    assert [s["thread_id"] for s in _sends(ctx)] == [None]
+    assert stats["threads"] == 0
+
+
+@pytest.mark.asyncio
+async def test_embed_only_message_is_migrated(state):
+    """Bot posts with a rich embed and no text used to be dropped (content and files were both empty)."""
+    reader = _reader({})
+    embed = {"type": "rich", "title": "Daily report", "description": "All systems go"}
+    embed_only = _msg(reader, 1, "", channel=NS(id=11))
+    embed_only.embeds = [embed]
+    empty = _msg(reader, 2, "", channel=NS(id=11))  # nothing to send at all: still skipped
+    reader.fetch_message_history = _reader({11: [embed_only, empty]}).fetch_message_history
+    ctx = _context(state, reader, ["7001"])
+
+    stats = await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    sends = _sends(ctx)
+    assert len(sends) == 1
+    assert sends[0]["embeds"] == [embed] and sends[0]["content"] == ""
+    assert stats["messages"] == 1
+    assert str(state.get_fluxer_message_id("501", "1")) == "7001"
+
+
+@pytest.mark.asyncio
+async def test_standalone_thread_is_created_at_its_notice_in_the_history(state):
+    """Threads aren't created while cloning anymore: a standalone thread (Discord posts a "thread created"
+    notice in the parent) is created when migration reaches that notice, so Fluxer's own notice lands
+    between the messages before and after it instead of above the whole history."""
+    thread = _thread(12, "side chat", parent_id=11)
+    reader = _reader({})
+    notice = _msg(reader, 101, "side chat", thread=thread)
+    notice.type = "thread_created"  # system message: not sent itself, but its thread is migrated here
+    history = {11: [_msg(reader, 100, "before"), notice, _msg(reader, 102, "after")], 12: [_msg(reader, 200, "inside")]}
+    reader.fetch_message_history = _reader(history).fetch_message_history
+    ctx = _context(state, reader, [])
+    order = []
+
+    async def send(**kwargs):
+        order.append(("send", kwargs["content"], kwargs.get("thread_id")))
+        return f"f{len(order)}"
+
+    async def create_thread(parent_id, name, **kwargs):
+        order.append(("create_thread", name, parent_id))
+        return "8888"
+
+    ctx.fluxer_writer.send_message = AsyncMock(side_effect=send)
+    ctx.fluxer_writer.create_thread = AsyncMock(side_effect=create_thread)
+
+    await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    assert order == [
+        ("send", "before", None),
+        ("create_thread", "side chat", "501"),
+        ("send", "inside", "8888"),
+        ("send", "after", None),
+    ]
+    ctx.fluxer_writer.create_thread_from_message.assert_not_awaited()
+    assert str(state.get_target_channel_id("12")) == "8888"
+
+
+def _finished_forum_post(state, newest_id):
+    """Forum 13 -> 503 with post 20 already migrated (messages 20, 21) and marked completed.
+    Discord now holds message 22 too; newest_id is the post's last_message_id."""
+    post = _thread(20, "Bug report", parent_id=13)
+    post.last_message_id = newest_id
+    state.set_channel_mapping("20", "p1")
+    state.update_thread_last_message_id("503", "20", "21")
+    state.update_thread_completed("503", "20", completed=True)
+    reader = _reader({})
+    history = {20: [_msg(reader, 20, "it broke"), _msg(reader, 21, "same here"), _msg(reader, 22, "still broken")]}
+    reader.fetch_message_history = _reader(history).fetch_message_history
+    reader.threads = [post]
+    reader.CHANNEL_TYPE_FORUM = NS(value=15)
+    reader.get_channel = AsyncMock(return_value=NS(type=NS(value=15)))
+    return reader
+
+
+@pytest.mark.asyncio
+async def test_completed_thread_with_new_messages_is_resumed(state):
+    """A finished thread/forum post used to be skipped forever, so messages posted later never arrived."""
+    reader = _finished_forum_post(state, newest_id=22)
+    ctx = _context(state, reader, ["m22"])
+
+    analysis = await analyze_migration(ctx, source_channel_id=13)
+    await migrate_messages(ctx, source_channel_id=13, target_channel_id="503")
+
+    assert (analysis["messages"], analysis["threads"]) == (1, 1)
+    sends = _sends(ctx)
+    assert len(sends) == 1
+    assert (sends[0]["content"], sends[0]["thread_id"]) == ("still broken", "p1")
+    assert str(state.get_thread_last_message_id("503", "20")) == "22"
+    assert state.is_thread_completed("503", "20")
+
+
+@pytest.mark.asyncio
+async def test_completed_thread_without_new_messages_is_skipped(state):
+    reader = _finished_forum_post(state, newest_id=21)
+    ctx = _context(state, reader, [])
+
+    analysis = await analyze_migration(ctx, source_channel_id=13)
+    await migrate_messages(ctx, source_channel_id=13, target_channel_id="503")
+
+    assert (analysis["messages"], analysis["threads"]) == (0, 0)  # finished threads aren't counted on resume
+    ctx.fluxer_writer.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attachment_is_downloaded_once_and_counted_once(state):
+    """F16: the migrate loop used to download attachments itself and again in _process_and_send_message."""
+    reader = _reader({})
+    att = NS(filename="a.png")
+    msg = _msg(reader, 100, "pic")
+    msg.attachments = [att]
+    reader.fetch_message_history = _reader({11: [msg]}).fetch_message_history
+    reader.download_attachment = AsyncMock(return_value=b"data")
+    ctx = _context(state, reader, ["f100"])
+
+    stats = await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    reader.download_attachment.assert_awaited_once_with(att)
+    assert stats["attachments"] == 1
+    assert _sends(ctx)[0]["files"] == [{"filename": "a.png", "data": b"data"}]
+
+
+@pytest.mark.asyncio
+async def test_already_migrated_message_is_not_downloaded_again(state):
+    state.set_message_mapping("501", "100", "f100")
+    reader = _reader({})
+    msg = _msg(reader, 100, "pic")
+    msg.attachments = [NS(filename="a.png")]
+    reader.fetch_message_history = _reader({11: [msg]}).fetch_message_history
+    reader.download_attachment = AsyncMock(return_value=b"data")
+    ctx = _context(state, reader, [])
+
+    await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    reader.download_attachment.assert_not_awaited()
+    ctx.fluxer_writer.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_waterfall_analysis_counts_messages_of_unmapped_threads(state):
+    """F17: threads only get a target during migration, so analysis counts them via their mapped parent."""
+    from src.fluxer.migrate_message import analyze_global_migration
+    thread = _thread(12, "help", parent_id=11)
+    reader = _reader({})
+    reader.fetch_global_message_history = _reader({
+        11: [_msg(reader, 100, "question", channel=NS(id=11, type=NS(value=0)))],
+        12: [_msg(reader, 200, "answer", channel=thread), _msg(reader, 201, "thanks", channel=thread)],
+    }).fetch_global_message_history
+    ctx = _context(state, reader, [])
+
+    stats = await analyze_global_migration(ctx)
+
+    assert stats["messages"] == 3
+
+
+def test_waterfall_resume_point_uses_thread_progress_by_discord_id(state):
+    """F19: thread_tracking is keyed by the Discord thread ID; target IDs never matched, so the point was 0."""
+    state.update_last_message_id("501", "500")
+    state.set_channel_mapping("12", "7000")
+    state.update_thread_last_message_id("501", "12", "300")
+    channels = [NS(id=11, type=NS(value=0)), NS(id=13, type=NS(value=15)), NS(id=10, type=NS(value=4))]
+
+    # forum (no own progress) and category don't pull it to 0
+    assert state.waterfall_resume_point(channels, [_thread(12, "t", parent_id=11)]) == 300
+
+
+def test_waterfall_resume_point_bounds_unmigrated_threads_by_their_id(state):
+    """A thread without progress (new, or skipped earlier as archived) can't have messages older than itself."""
+    state.update_last_message_id("501", "500")
+    channels = [NS(id=11, type=NS(value=0))]
+
+    assert state.waterfall_resume_point(channels, [_thread(400, "new", parent_id=11)]) == 399
+    assert state.waterfall_resume_point(channels, [_thread(900, "newer", parent_id=11)]) == 500
+
+
+def test_waterfall_resume_point_is_none_without_progress(state):
+    assert state.waterfall_resume_point([NS(id=11, type=NS(value=0))], [_thread(400, "t", parent_id=11)]) is None
+
+
+@pytest.mark.asyncio
+async def test_waterfall_analysis_skips_already_migrated_channel_messages(state):
+    """F20: channel progress is keyed by the target channel ID (the analysis looked it up by the Discord ID)."""
+    from src.fluxer.migrate_message import analyze_global_migration
+    state.update_last_message_id("501", "100")
+    reader = _reader({})
+    general = NS(id=11, type=NS(value=0))
+    reader.fetch_global_message_history = _reader({
+        11: [_msg(reader, 100, "old", channel=general), _msg(reader, 101, "new", channel=general)],
+    }).fetch_global_message_history
+    ctx = _context(state, reader, [])
+
+    stats = await analyze_global_migration(ctx)
+
+    assert stats["messages"] == 1
+
+
+@pytest.mark.asyncio
+async def test_waterfall_creates_message_thread_from_its_starter_and_counts_it_once(state):
+    """F22: the waterfall created such threads standalone; F21: they were counted twice (int vs str ID)."""
+    from src.fluxer.migrate_message import analyze_global_migration
+    thread = _thread(100, "help", parent_id=11)
+    reader = _reader({})
+    general = NS(id=11, type=NS(value=0))
+    history = {11: [_msg(reader, 100, "question", thread=thread, channel=general)],
+               100: [_msg(reader, 101, "answer", channel=thread), _msg(reader, 102, "thanks", channel=thread)]}
+    reader.fetch_global_message_history = _reader(history).fetch_global_message_history
+    ctx = _context(state, reader, ["f100", "f101", "f102"])
+
+    analysis = await analyze_global_migration(ctx)
+    stats = await migrate_global_messages(ctx)
+
+    ctx.fluxer_writer.create_thread_from_message.assert_awaited_once()
+    assert ctx.fluxer_writer.create_thread_from_message.await_args.args[:2] == ("501", "f100")
+    ctx.fluxer_writer.create_thread.assert_not_awaited()
+    assert [s["thread_id"] for s in _sends(ctx)] == [None, "8889", "8889"]
+    assert analysis["threads"] == stats["threads"] == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_is_not_treated_as_reply(state):
+    """F24: the forward's reference (the original message) became a reply fallback '@author' line."""
+    reader = _reader({})
+    fwd = _msg(reader, 100, "forwarded text")
+    fwd.flags = NS(forwarded=True)
+    fwd.message_snapshots = []
+    fwd.reference = NS(message_id=50)
+    reader.fetch_message_history = _reader({11: [fwd]}).fetch_message_history
+    reader.get_message = AsyncMock(return_value=NS(author=NS(id=2, display_name="Bob")))
+    ctx = _context(state, reader, ["f100"])
+
+    await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    send = _sends(ctx)[0]
+    assert send["content"] == "forwarded text" and send["reply_to_message_id"] is None and send["is_forwarded"]
+    reader.get_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unpinged_user_mention_is_resolved_by_the_reader(state):
+    """F23: the REST reader has no member cache; users missing from msg.mentions became '@Unknown User'."""
+    reader = _reader({})
+    reader.guild = NS(get_member=lambda uid: None)
+    reader.get_member_display_name = AsyncMock(side_effect=lambda uid: {7: "Carol"}.get(uid))
+    msg = _msg(reader, 100, "hi <@7> and <@!8>")
+    reader.fetch_message_history = _reader({11: [msg]}).fetch_message_history
+    ctx = _context(state, reader, ["f100"])
+
+    await migrate_messages(ctx, source_channel_id=11, target_channel_id="501")
+
+    assert _sends(ctx)[0]["content"] == "hi `@Carol` and `@Unknown User`"

@@ -247,12 +247,13 @@ class BackupAsset:
 class BackupRole:
     """Minimal stand-in for discord.Role."""
 
-    __slots__ = ("id", "name", "color", "position", "permissions", "hoist", "managed", "mentionable")
+    __slots__ = ("id", "name", "color", "position", "permissions", "hoist", "managed", "mentionable", "bot_id")
 
     def __init__(self, data: dict):
         if not isinstance(data, dict):
             self.id = 0
             self.name = "Unknown"
+            self.bot_id = None
             return
         self.id = parse_snowflake(data["id"])
         self.name = data["name"]
@@ -260,8 +261,14 @@ class BackupRole:
         self.position = data.get("position", 0)
         self.permissions = BackupPermissions(parse_snowflake(data.get("permissions", 0)) or 0)
         self.hoist = bool(data.get("hoist", False))
-        self.managed = False
+        self.managed = bool(data.get("managed"))
         self.mentionable = bool(data.get("mentionable", True))
+        # Backups made before the column existed have no bot_id: those roles count as regular roles
+        self.bot_id = parse_snowflake(data.get("bot_id")) or None
+
+    def is_bot_managed(self) -> bool:
+        """Like discord.Role.is_bot_managed(): the role a bot gets when it joins."""
+        return bool(self.bot_id)
 
     @property
     def mention(self) -> str:
@@ -323,7 +330,9 @@ class BackupChannel:
 
     __slots__ = ("id", "name", "type", "position", "topic", "nsfw",
                  "category_id", "available_tags", "parent_id", "guild", "overwrites",
-                 "bitrate", "slowmode_delay")
+                 "bitrate", "slowmode_delay", "flags", "default_auto_archive_duration",
+                 "default_thread_slowmode_delay", "default_sort_order", "default_layout",
+                 "default_reaction_emoji")
 
     _TYPE_MAP = {
         "text": ChannelType.text,
@@ -344,6 +353,20 @@ class BackupChannel:
         self.nsfw = bool(data.get("nsfw", False))
         self.bitrate = data.get("bitrate")
         self.slowmode_delay = data.get("slowmode_delay")
+        # Thread / forum settings (None in backups made before they were saved)
+        self.flags = data.get("flags")
+        self.default_auto_archive_duration = data.get("default_auto_archive_duration")
+        self.default_thread_slowmode_delay = data.get("default_thread_slowmode_delay")
+        self.default_sort_order = data.get("default_sort_order")
+        self.default_layout = data.get("default_layout")
+        self.default_reaction_emoji = None
+        raw_emoji = data.get("default_reaction_emoji")
+        if raw_emoji:
+            try:
+                e = json.loads(raw_emoji) if isinstance(raw_emoji, str) else raw_emoji
+                self.default_reaction_emoji = BackupPartialEmoji(name=e.get("name"), id=parse_snowflake(e.get("id")) or None)
+            except Exception:
+                pass
         cid = data.get("category_id")
         self.category_id = parse_snowflake(cid) if cid else category_id
         self.parent_id = self.category_id
@@ -645,7 +668,9 @@ class BackupThread:
     """Minimal stand-in for discord.Thread metadata attached to a starter message."""
 
     __slots__ = ("id", "name", "message_count", "archived",
-                 "auto_archive_duration", "locked", "parent_id", "applied_tags", "type")
+                 "auto_archive_duration", "locked", "parent_id", "applied_tags", "type",
+                 "member_count", "archive_timestamp", "slowmode_delay", "owner_id", "invitable", "flags",
+                 "last_message_id")
 
     def __init__(self, data: dict, parent_id: int | None = None):
         if not isinstance(data, dict):
@@ -665,6 +690,15 @@ class BackupThread:
         self.archived = data.get("archived", False)
         self.auto_archive_duration = data.get("auto_archive_duration", 1440)
         self.locked = data.get("locked", False)
+        self.member_count = data.get("member_count")
+        self.archive_timestamp = data.get("archive_timestamp")
+        # None in backups made before these were saved
+        self.slowmode_delay = data.get("slowmode_delay")
+        self.owner_id = parse_snowflake(data.get("owner_id")) or None
+        self.invitable = data.get("invitable")
+        self.flags = data.get("flags")
+        # Newest backed-up message (like discord.Thread.last_message_id); set by BackupReader when loading
+        self.last_message_id = parse_snowflake(data.get("last_message_id")) or None
         pid = data.get("parent_id")
         self.parent_id = parse_snowflake(pid) if pid else parent_id
         
@@ -1031,6 +1065,11 @@ class BackupReader:
     CHANNEL_TYPE_VOICE = ChannelType.voice
     CHANNEL_TYPE_NEWS = ChannelType.news
     CHANNEL_TYPE_FORUM = ChannelType.forum
+    CHANNEL_TYPE_THREAD_PUBLIC = ChannelType.public_thread
+    CHANNEL_TYPE_THREAD_PRIVATE = ChannelType.private_thread
+    CHANNEL_TYPE_THREAD_ANNOUNCEMENT = ChannelType.news_thread
+    # Channel types that are never read or migrated (raw Discord type values)
+    SKIPPED_CHANNEL_TYPES = frozenset({20})
 
     @staticmethod
     def find_item(iterable, **attrs):
@@ -1119,6 +1158,9 @@ class BackupReader:
         rows = self.db.get_all_channels()
         
         for data in rows:
+            if parse_snowflake(data.get("type")) in self.SKIPPED_CHANNEL_TYPES:
+                logger.info(f"[Backup] Skipping channel {data.get('name')} ({data.get('id')}) of type {data.get('type')}")
+                continue
             if data["type"] == 4: # Category
                 self._categories.append(BackupCategory(data))
             else:
@@ -1126,8 +1168,9 @@ class BackupReader:
         
         # Load threads
         thread_rows = self.db.get_all_threads()
+        last_ids = self.db.get_last_message_ids()
         for tdata in thread_rows:
-            thread = BackupThread(tdata)
+            thread = BackupThread({**tdata, "last_message_id": last_ids.get(parse_snowflake(tdata.get("id")))})
             self._threads.append(thread)
             if thread.id:
                 self._thread_map[thread.id] = thread
@@ -1288,6 +1331,20 @@ class BackupReader:
         """Uniform interface for active threads."""
         return [t for t in self.threads if not t.archived]
 
+    async def get_threads(self, include_archived: bool = False) -> List[BackupThread]:
+        """
+        Uniform interface for the guild's threads (incl. forum posts).
+        include_archived=False returns only active threads.
+        Only threads saved by a message backup are in the database.
+        """
+        if include_archived:
+            return list(self.threads)
+        return await self.get_active_threads()
+
+    async def has_archived_threads(self, channel_id: int) -> bool:
+        """True if the backup holds at least one archived thread of the channel."""
+        return any(t.parent_id == channel_id and t.archived for t in self.threads)
+
     async def get_backed_up_channel_ids(self) -> List[int]:
         """Returns a list of channel IDs that have messages in the database."""
         if not self.db: return []
@@ -1302,6 +1359,10 @@ class BackupReader:
                 return t
         return None
 
+    async def channel_exists(self, channel_id: int) -> bool | None:
+        """True if the backup has the channel/thread, else None: a backup can't tell whether Discord deleted it."""
+        return True if await self.get_channel(int(channel_id)) else None
+
     # ── roles, emojis, stickers, members ─────────────────────────────────
 
     async def get_roles(self) -> List[BackupRole]:
@@ -1312,6 +1373,12 @@ class BackupReader:
 
     async def get_stickers(self) -> List[BackupSticker]:
         return list(self.stickers)
+
+    async def get_member_display_name(self, user_id: int) -> str | None:
+        """Same as DiscordReader.get_member_display_name, from the backed-up users."""
+        member = self.guild.get_member(int(user_id)) if self.guild else None
+        name = getattr(member, "display_name", None)
+        return name if name and name != "Unknown" else None
 
     async def get_members(self) -> List[BackupMember]:
         return list(self.members)
@@ -1365,7 +1432,10 @@ class BackupReader:
         
         channel_id = parse_snowflake(msg_data["channel_id"])
         channel = next((c for c in self.channels if c.id == channel_id), None)
-        
+        if channel is None:
+            # Thread / forum post messages: their channel is the thread (like discord.py's msg.channel)
+            channel = self._thread_map.get(channel_id)
+
         bm = BackupMessage(
             msg_data,
             author=author,

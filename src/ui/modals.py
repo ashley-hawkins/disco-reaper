@@ -460,6 +460,110 @@ class SubMenuModal(ModalScreen[str]):
 
 
 # ---------------------------------------------------------------------------
+# ArchivedThreadsModal – popup before migrating channels with archived threads
+# ---------------------------------------------------------------------------
+
+class ArchivedThreadsModal(ModalScreen[bool | None]):
+    """Popup asking whether a migration includes archived threads.
+    Returns True (active + archived), False (active only) or None (cancel)."""
+    DEFAULT_CSS = """
+    ArchivedThreadsModal { align: center middle; }
+    #archived_dialog {
+        width: 64;
+        max-width: 90%;
+        height: auto;
+        border: thick $warning;
+        padding: 1 2;
+        background: $surface;
+    }
+    #archived_title { text-style: bold; color: $warning; margin-bottom: 1; width: 100%; }
+    #archived_msg { margin-bottom: 1; width: 100%; }
+    #archived_buttons { height: auto; }
+    #archived_buttons Button { width: 1fr; margin: 0 1; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, channel_names: list[str]):
+        super().__init__()
+        names = ", ".join(f"#{n}" for n in channel_names[:5])
+        if len(channel_names) > 5:
+            names += f" and {len(channel_names) - 5} more"
+        self._names = names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="archived_dialog"):
+            yield Label("⚠ Archived threads found", id="archived_title")
+            yield Label(
+                f"{self._names} contain archived threads or forum posts.\n\n"
+                "Migrating them can take a long time on big servers. "
+                "Skipped archived threads can still be migrated in a later run.",
+                id="archived_msg"
+            )
+            with Horizontal(id="archived_buttons"):
+                yield Button("Active + Archived", id="btn_threads_all", variant="warning",
+                             tooltip="Migrate active and archived threads")
+                yield Button("Active Only", id="btn_threads_active", variant="primary",
+                             tooltip="Skip archived threads for now")
+                yield Button("Cancel", id="btn_threads_cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss({"btn_threads_all": True, "btn_threads_active": False}.get(event.button.id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DeletedChannelsModal(ModalScreen[bool]):
+    """Confirmation before deleting target copies of channels/threads that were deleted on Discord.
+    Returns True (delete) or False (keep)."""
+    DEFAULT_CSS = """
+    DeletedChannelsModal { align: center middle; }
+    #deleted_dialog {
+        width: 70;
+        max-width: 90%;
+        height: auto;
+        max-height: 90%;
+        border: thick $error;
+        padding: 1 2;
+        background: $surface;
+    }
+    #deleted_title { text-style: bold; color: $error; margin-bottom: 1; width: 100%; }
+    #deleted_list { height: auto; max-height: 16; margin-bottom: 1; }
+    #deleted_msg { margin-bottom: 1; width: 100%; }
+    #deleted_buttons { height: auto; }
+    #deleted_buttons Button { width: 1fr; margin: 0 1; }
+    """
+    BINDINGS = [("escape", "keep", "Keep")]
+    _ICONS = {"category": "📁", "channel": "#", "thread": "🧵"}
+
+    def __init__(self, items: list[dict], target_name: str = "Fluxer"):
+        super().__init__()
+        self._items = items
+        self._target_name = target_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="deleted_dialog"):
+            yield Label(f"⚠ {len(self._items)} deleted on Discord", id="deleted_title")
+            with VerticalScroll(id="deleted_list"):
+                for item in self._items:
+                    yield Label(f"{self._ICONS.get(item['kind'], '-')} {item['name']}", markup=False)
+            yield Label(
+                f"These were migrated before and have since been deleted on Discord. Deleting them on "
+                f"{self._target_name} also deletes their migrated messages. This cannot be undone.",
+                id="deleted_msg"
+            )
+            with Horizontal(id="deleted_buttons"):
+                yield Button(f"Delete on {self._target_name}", id="btn_deleted_delete", variant="error")
+                yield Button("Keep", id="btn_deleted_keep", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn_deleted_delete")
+
+    def action_keep(self) -> None:
+        self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
 # OptionSelectModal – radio-button selection list
 # ---------------------------------------------------------------------------
 

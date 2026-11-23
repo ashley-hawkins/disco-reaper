@@ -64,6 +64,7 @@ def test_save_messages_and_attachments(db):
             "id": 101, "channel_id": 10, "author_id": 999, "content": "Hello",
             "timestamp": "2023-01-01T00:00:00Z", "type": 0,
             "message_reference": None, "is_pinned": 0, "extra_data": None,
+            "custom_display_name": None, "custom_avatar_url": None,
             "attachments": [
                 {"id": 1, "filename": "file.png", "size": 100,
                  "url": "http://cdn.test/file.png", "content_type": "image/png", "local_hash": "abc"}
@@ -127,9 +128,11 @@ def test_get_last_message_id(db):
     msgs = [
         {"id": 200, "channel_id": 10, "author_id": 1, "content": "a",
          "timestamp": "2023-01-01T00:00:00Z", "type": 0,
+         "custom_display_name": None, "custom_avatar_url": None,
          "message_reference": None, "is_pinned": 0, "extra_data": None},
         {"id": 201, "channel_id": 10, "author_id": 1, "content": "b",
          "timestamp": "2023-01-01T00:01:00Z", "type": 0,
+         "custom_display_name": None, "custom_avatar_url": None,
          "message_reference": None, "is_pinned": 0, "extra_data": None},
     ]
     db.save_messages_batch(msgs)
@@ -140,9 +143,11 @@ def test_stats_by_channel(db):
     msgs = [
         {"id": 101, "channel_id": 10, "author_id": 1, "content": "Hi",
          "timestamp": "2023-01-01T00:00:00Z", "type": 0,
+         "custom_display_name": None, "custom_avatar_url": None,
          "message_reference": None, "is_pinned": 0, "extra_data": None},
         {"id": 102, "channel_id": 10, "author_id": 1, "content": "Bye",
          "timestamp": "2023-01-01T00:01:00Z", "type": 0,
+        "custom_display_name": None, "custom_avatar_url": None,
          "message_reference": None, "is_pinned": 0, "extra_data": None},
     ]
     db.save_messages_batch(msgs)
@@ -175,6 +180,7 @@ def test_get_messages_paged_after_id(db):
     msgs = [
         {"id": i, "channel_id": 10, "author_id": 1, "content": f"msg{i}",
          "timestamp": f"2023-01-01T00:0{i}:00Z", "type": 0,
+         "custom_display_name": None, "custom_avatar_url": None,
          "message_reference": None, "is_pinned": 0, "extra_data": None}
         for i in range(5)
     ]
@@ -183,3 +189,43 @@ def test_get_messages_paged_after_id(db):
     assert len(page) == 3
     page_after = db.get_messages_paged("10", limit=10, after_id="2")
     assert all(m["id"] > 2 for m in page_after)
+
+
+def _perm(channel_id, target_id, allow=0, deny=0):
+    return {"channel_id": str(channel_id), "target_id": str(target_id), "target_type": "role",
+            "allow": allow, "deny": deny}
+
+
+def _perm_rows(db):
+    return [tuple(r) for r in db._conn.execute(
+        "SELECT channel_id, target_id, allow, deny FROM permissions ORDER BY channel_id, target_id").fetchall()]
+
+
+def test_save_permissions_rebackup_replaces_instead_of_duplicating(db):
+    db.save_permissions([_perm(10, 1, allow=1024), _perm(10, 2, deny=1024)], channel_ids=["10"])
+    # Re-backup: role 2's overwrite was removed and role 1's changed on Discord
+    db.save_permissions([_perm(10, 1, allow=2048)], channel_ids=["10"])
+    assert _perm_rows(db) == [(10, 1, 2048, 0)]
+
+
+def test_save_permissions_clears_channels_without_overwrites(db):
+    db.save_permissions([_perm(10, 1, allow=1024), _perm(20, 1, deny=1024)], channel_ids=["10", "20"])
+    # Channel 10 has no overwrites any more; it's still listed as backed up
+    db.save_permissions([_perm(20, 1, deny=1024)], channel_ids=["10", "20"])
+    assert _perm_rows(db) == [(20, 1, 0, 1024)]
+
+
+def test_save_permissions_keeps_other_channels(db):
+    db.save_permissions([_perm(10, 1, allow=1024), _perm(20, 1, deny=1024)])
+    # Without channel_ids only the channels in the batch are replaced
+    db.save_permissions([_perm(10, 3, allow=8)])
+    assert _perm_rows(db) == [(10, 3, 8, 0), (20, 1, 0, 1024)]
+
+
+def test_get_all_channels_overwrites_not_duplicated_after_rebackup(db):
+    db.save_channels([{"id": "10", "name": "general", "type": 0, "position": 0, "category_id": None,
+                       "topic": None, "nsfw": 0, "bitrate": None, "slowmode_delay": None}])
+    for _ in range(3):
+        db.save_permissions([_perm(10, 1, allow=1024)], channel_ids=["10"])
+    channel = db.get_all_channels()[0]
+    assert len(channel["overwrites"]) == 1

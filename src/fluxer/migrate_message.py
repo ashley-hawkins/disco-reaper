@@ -1,10 +1,12 @@
 import asyncio
+import inspect
 import logging
 import re
 import json
 import io
 from typing import Callable, Awaitable, Dict, Any, List
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     from lottie.objects import Animation
@@ -15,8 +17,38 @@ except ImportError:
 
 from src.core.base import MigrationContext
 from src.core.utils import resolve_discord_links
+from src.fluxer.clone_server import resolve_target_thread, apply_thread_state
 
 logger = logging.getLogger(__name__)
+
+_USER_MENTION = re.compile(r'<@!?([0-9]+)>')
+
+
+async def resolve_user_mentions(context: MigrationContext, content: str, mentions, anonymize_users: bool = False) -> list:
+    """
+    msg.mentions plus users mentioned in content without a ping (bot/webhook posts, allowed_mentions off),
+    resolved with reader.get_member_display_name. clean_mentions is synchronous and the live reader has no
+    member cache, so these names are looked up before it runs (else they become "@Unknown User").
+    """
+    mentions = list(mentions or [])
+    if anonymize_users or not content:
+        return mentions
+    reader = context.discord_reader
+    guild = getattr(reader, "guild", None)
+    known = {getattr(u, "id", None) for u in mentions}
+    for uid in {int(x) for x in _USER_MENTION.findall(content)} - known:
+        if guild is not None and guild.get_member(uid):
+            continue
+        try:
+            name = reader.get_member_display_name(uid)
+            name = await name if inspect.isawaitable(name) else name
+        except Exception as e:
+            logger.debug(f"Could not resolve mentioned user {uid}: {e}")
+            name = None
+        if isinstance(name, str) and name:
+            mentions.append(SimpleNamespace(id=uid, display_name=name))
+    return mentions
+
 
 def clean_mentions(content: str, guild, user_mentions=None, role_mentions=None, channel_mentions=None, emoji_map=None, channel_map=None, state=None, target_server_id=None, channel_names=None, anonymize_users=False) -> str:
     if content is None:
@@ -126,14 +158,58 @@ def clean_mentions(content: str, guild, user_mentions=None, role_mentions=None, 
     return content
 
 
-async def get_channel_threads(reader: Any, channel_id: int) -> List[Any]:
-    """Helper to fetch all threads (active and archived) for a channel from Live or Backup."""
+def _source_thread_parent_id(channel: Any) -> str | None:
+    """Parent channel ID if channel is a thread (types 10/11/12), else None."""
+    c_type = getattr(channel, "type", None)
+    raw_type = c_type.value if hasattr(c_type, "value") else c_type
+    parent_id = getattr(channel, "parent_id", None)
+    return str(parent_id) if raw_type in (10, 11, 12) and parent_id else None
+
+
+async def _is_forum_channel(context: MigrationContext, channel_id: int) -> bool:
+    """True for forum/media channels: they hold posts (threads) but no messages of their own."""
+    try:
+        channel = await context.discord_reader.get_channel(int(channel_id))
+    except Exception:
+        return False
+    c_type = getattr(channel, "type", None)
+    raw_type = c_type.value if hasattr(c_type, "value") else c_type
+    return raw_type in (context.discord_reader.CHANNEL_TYPE_FORUM.value, 16)
+
+
+def _skip_archived(context: MigrationContext, thread: Any) -> bool:
+    """True if thread is archived and this run migrates active threads only."""
+    return not getattr(context, "include_archived_threads", True) and bool(getattr(thread, "archived", False))
+
+
+def _completed_without_new_messages(context: MigrationContext, target_channel_id: str | None, thread: Any) -> bool:
+    """
+    True if the thread was fully migrated before and has nothing newer than its last migrated message, so a
+    resume can skip it. thread.last_message_id is the thread's newest message (discord.Thread from the REST
+    listing, BackupThread from the backup DB). If it's unknown, a completed thread is skipped as before.
+    """
+    if not target_channel_id or not context.state.is_thread_completed(target_channel_id, str(thread.id)):
+        return False
+    newest = getattr(thread, "last_message_id", None)
+    if not newest:
+        return True
+    migrated = context.state.get_thread_last_message_id(target_channel_id, str(thread.id))
+    return bool(migrated) and int(newest) <= int(migrated)
+
+
+async def _no_messages():
+    return
+    yield
+
+
+async def get_channel_threads(reader: Any, channel_id: int, include_archived: bool = True) -> List[Any]:
+    """Helper to fetch the threads of a channel from Live or Backup: active ones, plus archived ones if include_archived."""
     threads = []
     
     # 1. From Backup (BackupReader has 'db' attribute)
     if hasattr(reader, 'db') and hasattr(reader, 'threads'):
         for t in reader.threads:
-            if t.parent_id == channel_id:
+            if t.parent_id == channel_id and (include_archived or not getattr(t, 'archived', False)):
                 threads.append(t)
         return threads
 
@@ -142,12 +218,12 @@ async def get_channel_threads(reader: Any, channel_id: int) -> List[Any]:
         try:
             # Guild-wide active threads
             if hasattr(reader.guild, 'active_threads'):
-                for t in reader.guild.active_threads:
+                for t in await reader.guild.active_threads():
                     if t.parent_id == channel_id:
                         threads.append(t)
             
-            # Archived threads for this specific channel
-            channel = await reader.get_channel(channel_id)
+            # Archived threads for this specific channel (the slow part on big servers)
+            channel = await reader.get_channel(channel_id) if include_archived else None
             if hasattr(channel, 'archived_threads'):
                 # discord.py method
                 async for t in channel.archived_threads(limit=None):
@@ -167,12 +243,17 @@ async def _process_and_send_message(
     thread_id: str | None = None,
     parent_target_id: str | None = None,
     thread_name: str | None = None,
-    processed_threads: set | None = None
+    processed_threads: set | None = None,
+    thread_target: Dict[str, Any] | None = None
 ) -> str | None:
     """
     Internal helper to process a single Discord message (mentions, attachments, stickers)
     and send it to the Fluxer platform.
+    thread_target: {"id": Fluxer thread ID, "post_name": forum post name} when thread_id is migrated
+        into a real Fluxer thread (target_channel_id stays its parent). Without it, thread messages
+        are sent inline into the parent channel with markers.
     """
+    native_thread = bool(thread_id and thread_target and (thread_target.get("id") or thread_target.get("post_name")))
     # 1. Formatting
     content = msg.content or ""
     
@@ -261,11 +342,12 @@ async def _process_and_send_message(
         except Exception as e:
             logger.error(f"Failed to download attachment {att.filename}: {e}")
 
-    # Clean Mentions
+    # Clean Mentions (users mentioned without a ping are looked up first)
+    user_mentions = await resolve_user_mentions(context, content, msg.mentions, anonymize_users)
     content = clean_mentions(
         content=content,
         guild=context.discord_reader.guild,
-        user_mentions=msg.mentions,
+        user_mentions=user_mentions,
         role_mentions=msg.role_mentions,
         channel_mentions=msg.channel_mentions,
         emoji_map=context.state.emoji_map,
@@ -276,13 +358,19 @@ async def _process_and_send_message(
         anonymize_users=anonymize_users
     )
 
-    if not content and not files:
+    # Embed-only messages (e.g. bot posts with a rich embed and no text) are migrated too
+    if not content and not files and not getattr(msg, "embeds", None):
         return None
 
     # Reply Resolution
     reply_to_fluxer_id = None
-    if msg.reference and msg.reference.message_id:
-        reply_to_fluxer_id = context.state.get_fluxer_message_id(target_channel_id, str(msg.reference.message_id))
+    # A forward's reference points at the forwarded (original) message, not a reply target
+    if msg.reference and msg.reference.message_id and not is_forwarded:
+        if native_thread:
+            # A reply must point into the same thread on Fluxer
+            reply_to_fluxer_id = context.state.get_thread_message_id(target_channel_id, thread_id, str(msg.reference.message_id))
+        else:
+            reply_to_fluxer_id = context.state.get_fluxer_message_id(target_channel_id, str(msg.reference.message_id))
         
         # Fallback author tagging for replies if mapping not found
         if not reply_to_fluxer_id:
@@ -296,11 +384,12 @@ async def _process_and_send_message(
                     if tgt_reply: content = f"[Reply to {tgt_reply}]\n{content}"
             except Exception: pass
 
-    # Thread logic
-    if not reply_to_fluxer_id and parent_target_id and stats["messages"] == 0:
-        reply_to_fluxer_id = parent_target_id
-    if thread_name and stats["messages"] == 0:
-        content = f"> <<< THREAD: **{thread_name}** >>>\n{content}"
+    # Thread logic (inline fallback when there is no Fluxer thread)
+    if not native_thread:
+        if not reply_to_fluxer_id and parent_target_id and stats["messages"] == 0:
+            reply_to_fluxer_id = parent_target_id
+        if thread_name and stats["messages"] == 0:
+            content = f"> <<< THREAD: **{thread_name}** >>>\n{content}"
 
     # Send Message
     if anonymize_users:
@@ -319,8 +408,15 @@ async def _process_and_send_message(
         files=files if files else None,
         reply_to_message_id=reply_to_fluxer_id,
         is_forwarded=is_forwarded,
-        embeds=msg.embeds
+        embeds=msg.embeds,
+        thread_id=thread_target.get("id") if native_thread else None,
+        thread_name=thread_target.get("post_name") if native_thread and not thread_target.get("id") else None
     )
+
+    if fluxer_msg_id and native_thread and not thread_target.get("id"):
+        # This message created the forum post; the post ID equals its first message's ID
+        thread_target["id"], thread_target["post_name"] = fluxer_msg_id, None
+        context.state.set_channel_mapping(thread_id, fluxer_msg_id)
 
     if fluxer_msg_id:
         if thread_id:
@@ -347,22 +443,27 @@ async def analyze_migration(context: MigrationContext, source_channel_id: int, a
     """
     stats = {"messages": 0, "threads": 0, "attachments": 0}
     
+    # Forum channels have no messages of their own; count their posts (threads) below
+    is_forum = processed_threads is None and await _is_forum_channel(context, source_channel_id)
     if processed_threads is None:
         processed_threads = set()
 
-    async for msg in context.discord_reader.fetch_message_history(source_channel_id, after_id=after_message_id, inclusive=inclusive):
+    history = _no_messages() if is_forum else context.discord_reader.fetch_message_history(source_channel_id, after_id=after_message_id, inclusive=inclusive)
+    async for msg in history:
         if not context.is_running:
             break
         
         # Count thread messages and markers even if parent is skipped
-        if hasattr(msg, 'thread') and msg.thread:
+        if hasattr(msg, 'thread') and msg.thread and not _skip_archived(context, msg.thread):
             thread = msg.thread
+            target_channel_id = context.state.get_target_channel_id(str(source_channel_id))
+            if thread.id not in processed_threads and _completed_without_new_messages(context, target_channel_id, thread):
+                processed_threads.add(thread.id)  # finished, nothing new: migration skips it too
             if thread.id not in processed_threads:
                 processed_threads.add(thread.id)
                 stats["threads"] += 1
-                
+
                 # Fetch last migrated message ID for this thread
-                target_channel_id = context.state.get_target_channel_id(str(source_channel_id))
                 thread_after_id = None
                 if target_channel_id:
                     thread_after_id = context.state.get_thread_last_message_id(target_channel_id, str(thread.id))
@@ -396,16 +497,20 @@ async def analyze_migration(context: MigrationContext, source_channel_id: int, a
 
     # After scanning messages, explicitly check for any missed threads (e.g. archived or skipped in scan)
     # Only do this at the top level (not in recursive thread calls)
-    if after_message_id is not None or inclusive: # Usually top level calls have some start point
+    if is_forum or after_message_id is not None or inclusive: # Usually top level calls have some start point
         # Optimization: We check all threads for the channel
-        all_threads = await get_channel_threads(context.discord_reader, source_channel_id)
+        all_threads = await get_channel_threads(context.discord_reader, source_channel_id,
+                                                include_archived=getattr(context, "include_archived_threads", True))
         for t in all_threads:
             if t.id not in processed_threads:
                 processed_threads.add(t.id)
-                stats["threads"] += 1
-                
-                # Fetch last migrated message ID for this thread
                 target_channel_id = context.state.get_target_channel_id(str(source_channel_id))
+                # Same skip as migrate_messages: finished threads without new messages aren't counted
+                if _completed_without_new_messages(context, target_channel_id, t):
+                    continue
+                stats["threads"] += 1
+
+                # Fetch last migrated message ID for this thread
                 thread_after_id = None
                 if target_channel_id:
                     thread_after_id = context.state.get_thread_last_message_id(target_channel_id, str(t.id))
@@ -428,9 +533,14 @@ async def migrate_messages(
     thread_id: str | None = None,
     parent_target_id: str | None = None,
     thread_name: str | None = None,
-    processed_threads: set | None = None
+    processed_threads: set | None = None,
+    thread: Any = None
 ) -> Dict[str, Any]:
-    """Migrate messages for a specific channel and returns detailed statistics."""
+    """Migrate messages for a specific channel and returns detailed statistics.
+    thread: the source thread object when migrating a thread (source_channel_id == thread.id).
+        Its messages go into the matching Fluxer thread, created if needed; parent_target_id is then
+        the Fluxer message the thread starts from.
+    """
     stats = {
         "messages": 0, 
         "threads": 0, 
@@ -442,6 +552,23 @@ async def migrate_messages(
     }
     
     logger.info(f"Starting message migration: Discord #{source_channel_id} -> Fluxer #{target_channel_id}")
+
+    # Real Fluxer thread for this source thread; falls back to inline markers if it can't be created
+    thread_target = None
+    if thread_id and thread is not None:
+        try:
+            mapped_parent = context.state.get_fluxer_channel_id(str(getattr(thread, "parent_id", "")))
+            if mapped_parent and str(mapped_parent) != str(target_channel_id):
+                # The webhook belongs to target_channel_id; Fluxer only accepts threads of that channel
+                logger.warning(f"Thread '{thread_name}' belongs to Fluxer channel {mapped_parent}, not the chosen target "
+                               f"{target_channel_id}; sending it inline")
+            else:
+                _, target_thread_id, post_name = await resolve_target_thread(context, thread, parent_message_id=parent_target_id)
+                if target_thread_id or post_name:
+                    thread_target = {"id": target_thread_id, "post_name": post_name}
+        except Exception as e:
+            logger.error(f"Could not create Fluxer thread for '{thread_name}' ({thread_id}), sending inline: {e}")
+    stats["native_thread"] = thread_target is not None
     if after_message_id:
         logger.info(f"Starting migration of {source_channel_id} (inclusive={inclusive})...")
     
@@ -473,17 +600,21 @@ async def migrate_messages(
         if not context.is_running:
             return
         logger.info(f"Checking for missed or pending threads in channel {source_channel_id}...")
-        all_threads = await get_channel_threads(context.discord_reader, source_channel_id)
+        all_threads = sorted(await get_channel_threads(context.discord_reader, source_channel_id,
+                                                       include_archived=getattr(context, "include_archived_threads", True)),
+                             key=lambda t: int(t.id))
         for t in all_threads:
             if not context.is_running:
                 break
             if t.id not in processed_threads:
                 processed_threads.add(t.id)
                 
-                # Skip if thread was already fully migrated in a previous run
-                if context.state.is_thread_completed(target_channel_id, str(t.id)):
+                # Skip if thread was already fully migrated in a previous run and got no new messages since
+                if _completed_without_new_messages(context, target_channel_id, t):
                     logger.debug(f"Skipping already completed thread '{t.name}' (ID: {t.id})")
                     continue
+                if context.state.is_thread_completed(target_channel_id, str(t.id)):
+                    logger.info(f"Completed thread '{t.name}' (ID: {t.id}) has new messages, resuming it")
 
                 logger.info(f"Checking missed thread '{t.name}' (ID: {t.id})")
                 
@@ -501,13 +632,16 @@ async def migrate_messages(
                     thread_id=str(t.id),
                     parent_target_id=None,
                     thread_name=t.name,
-                    processed_threads=processed_threads
+                    processed_threads=processed_threads,
+                    thread=t
                 )
                 stats["messages"] += thread_stats["messages"]
                 stats["attachments"] += thread_stats["attachments"]
                 stats["threads"] += thread_stats["threads"]
+                if progress_callback:
+                    await progress_callback(stats)
                 
-                if context.is_running:
+                if context.is_running and not thread_stats.get("native_thread"):
                     await context.fluxer_writer.send_marker(
                         channel_id=target_channel_id,
                         content=f"> <<< END OF THREAD >>>"
@@ -516,10 +650,13 @@ async def migrate_messages(
     try:
         # If resuming (after_message_id is set) and at top level, check for pending threads FIRST
         # to preserve chronological order (finish old unfinished business first)
-        if not thread_id and after_message_id is not None:
+        # Forum channels have no messages of their own: every post is migrated as a thread
+        is_forum = not thread_id and await _is_forum_channel(context, source_channel_id)
+        if not thread_id and (is_forum or after_message_id is not None):
             await _process_missed_threads()
 
-        async for msg in context.discord_reader.fetch_message_history(source_channel_id, after_id=after_message_id, inclusive=inclusive):
+        history = _no_messages() if is_forum else context.discord_reader.fetch_message_history(source_channel_id, after_id=after_message_id, inclusive=inclusive)
+        async for msg in history:
             if not context.is_running:
                 logger.warning("Migration interrupted by user (is_running=False)")
                 break
@@ -539,7 +676,7 @@ async def migrate_messages(
                 context.discord_reader.MESSAGE_TYPE_AUTO_MODERATION_ACTION
             ]:
                 # If we are skipping the parent, we STILL need to check for a thread!
-                if hasattr(msg, 'thread') and msg.thread:
+                if hasattr(msg, 'thread') and msg.thread and not _skip_archived(context, msg.thread):
                     thread = msg.thread
                     if thread.id not in processed_threads:
                         processed_threads.add(thread.id)
@@ -560,14 +697,15 @@ async def migrate_messages(
                             thread_id=str(thread.id),
                             parent_target_id=None,
                             thread_name=thread.name,
-                            processed_threads=processed_threads
+                            processed_threads=processed_threads,
+                            thread=thread
                         )
                         stats["messages"] += thread_stats["messages"]
                         stats["attachments"] += thread_stats["attachments"]
                         stats["threads"] += thread_stats["threads"]
     
                         # Send End Marker
-                        if context.is_running:
+                        if context.is_running and not thread_stats.get("native_thread"):
                             await context.fluxer_writer.send_marker(
                                 channel_id=target_channel_id,
                                 content=f"> <<< END OF THREAD >>>"
@@ -576,156 +714,9 @@ async def migrate_messages(
                 if progress_callback:
                     await progress_callback(stats)
                 continue
-            else:
-                # Use custom clean_mentions with msg mentions for accuracy
-                content = clean_mentions(
-                    msg.content, 
-                    context.discord_reader.guild, 
-                    msg.mentions, 
-                    msg.role_mentions, 
-                    msg.channel_mentions,
-                    context.state.emoji_map,
-                    context.state.channel_map,
-                    state=context.state,
-                    target_server_id=context.fluxer_writer.community_id,
-                    channel_names=context.channel_names if hasattr(context, 'channel_names') else None,
-                    anonymize_users=context.config.anonymize_users
-                )
-                logger.debug(f"Message {msg.id} cleaned content length: {len(content) if content else 0}")
-                
-            # Process attachments
-            files = []
-            attachments_to_process = list(msg.attachments)
-            
-            # Check if this message is forwarded
-            # Discord flags: forwarded (is bit 28 / 0x10000000)
-            is_forwarded = False
-            if hasattr(msg.flags, 'forwarded'):
-                is_forwarded = msg.flags.forwarded
-            
-            # If forwarded, the content and attachments might be in message_snapshots (discord.py 2.5+)
-            # Note: If content was set by thread_starter_message, we don't overwrite it.
-            if is_forwarded:
-                logger.debug(f"Detected forwarded message: ID={msg.id}, Flags={msg.flags.value}")
-                if hasattr(msg, 'message_snapshots') and msg.message_snapshots:
-                    # For now we handle the first snapshot
-                    snapshot = msg.message_snapshots[0]
-                    if not content: # Only update content if it wasn't already set (e.g., by thread_starter_message)
-                        content = snapshot.content
-                        if context.discord_reader.guild:
-                            content = clean_mentions(
-                                content, 
-                                context.discord_reader.guild, 
-                                snapshot.mentions if hasattr(snapshot, 'mentions') else None,
-                                snapshot.role_mentions if hasattr(snapshot, 'role_mentions') else None,
-                                snapshot.channel_mentions if hasattr(snapshot, 'channel_mentions') else None, # Changed this line
-                                context.state.emoji_map,
-                                context.state.channel_map,
-                                state=context.state,
-                                target_server_id=context.fluxer_writer.community_id,
-                                channel_names=context.channel_names if hasattr(context, 'channel_names') else None,
-                                anonymize_users=context.config.anonymize_users
-                            )
-                    # Add snapshot attachments to the list to process
-                    attachments_to_process.extend(snapshot.attachments)
-                    logger.debug(f"Found forwarded snapshot content: {content[:50]}... and {len(snapshot.attachments)} attachments")
-
-            for att in attachments_to_process:
-                try:
-                    att_data = await context.discord_reader.download_attachment(att)
-                    files.append({"filename": att.filename, "data": att_data})
-                    stats["attachments"] += 1
-                except Exception as e:
-                    logger.error(f"Failed to download attachment {att.filename}: {e}")
-            
-            # Process stickers as attachments
-            if hasattr(msg, 'stickers') and msg.stickers:
-                for s in msg.stickers:
-                    try:
-                        sticker_data = await context.discord_reader.download_sticker(s)
-                        if sticker_data:
-                            # Use format to determine extension
-                            format_val = getattr(s, 'format', 'png')
-                            logger.debug(f"Sticker {getattr(s, 'name', 'unknown')} format_val type: {type(format_val)}, value: {format_val}")
-                            
-                            if hasattr(format_val, 'name'): # discord.py StickerFormat enum
-                                ext = format_val.name.lower()
-                            elif isinstance(format_val, int):
-                                format_map = {1: 'png', 2: 'apng', 3: 'lottie', 4: 'gif'}
-                                ext = format_map.get(format_val, 'png')
-                            else:
-                                ext = str(format_val).lower()
-                            
-                            logger.debug(f"Determined sticker extension: {ext}")
-                            
-                            # Fluxer: Convert animated stickers to WebP
-                            # Lottie (json) → GIF (via lottie lib) → WebP (via Pillow)
-                            if ext == 'lottie':
-                                if HAS_LOTTIE:
-                                    try:
-                                        logger.debug(f"Converting Lottie sticker {s.name} (ID: {s.id}) to WebP...")
-                                        lottie_data = json.loads(sticker_data)
-                                        
-                                        def _convert_lottie(data):
-                                            anim = Animation.load(data)
-                                            buf = io.BytesIO()
-                                            export_gif(anim, buf)
-                                            buf.seek(0)
-                                            return buf
-
-                                        gif_buf = await asyncio.to_thread(_convert_lottie, lottie_data)
-                                        
-                                        # GIF → WebP via Pillow
-                                        from PIL import Image
-                                        
-                                        def _convert_gif_to_webp(buf):
-                                            img = Image.open(buf)
-                                            w_buf = io.BytesIO()
-                                            if getattr(img, 'n_frames', 1) > 1:
-                                                img.save(w_buf, format='WEBP', save_all=True, loop=0, quality=80)
-                                            else:
-                                                img.save(w_buf, format='WEBP', quality=80)
-                                            return w_buf.getvalue()
-
-                                        sticker_data = await asyncio.to_thread(_convert_gif_to_webp, gif_buf)
-                                        ext = 'webp'
-                                        logger.debug(f"Successfully converted Lottie sticker {s.name} to WebP")
-                                    except Exception as conv_err:
-                                        logger.error(f"Failed to convert Lottie sticker {s.name} to WebP: {conv_err}")
-                                        ext = 'json'
-                                else:
-                                    logger.warning(f"Lottie library not available, sending sticker {s.name} as raw JSON")
-                                    ext = 'json'
-                            
-                            elif ext in ('apng', 'gif'):
-                                try:
-                                    logger.debug(f"Converting {ext.upper()} sticker {s.name} (ID: {s.id}) to WebP...")
-                                    from PIL import Image
-                                    
-                                    def _process_animated_sticker(data):
-                                        img = Image.open(io.BytesIO(data))
-                                        webp_buf = io.BytesIO()
-                                        if getattr(img, 'n_frames', 1) > 1:
-                                            img.save(webp_buf, format='WEBP', save_all=True, loop=0, quality=80)
-                                        else:
-                                            img.save(webp_buf, format='WEBP', quality=80)
-                                        return webp_buf.getvalue()
-
-                                    sticker_data = await asyncio.to_thread(_process_animated_sticker, sticker_data)
-                                    ext = 'webp'
-                                    logger.debug(f"Successfully converted sticker {s.name} to WebP")
-                                except Exception as conv_err:
-                                    logger.error(f"Failed to convert {ext.upper()} sticker {s.name} to WebP: {conv_err}")
-                                    # Keep original format as fallback
-                            
-                            filename = f"sticker_{s.name}_{s.id}.{ext}"
-                            sticker_size = len(sticker_data)
-                            files.append({"filename": filename, "data": sticker_data})
-                            stats["attachments"] += 1
-                            logger.debug(f"Added sticker {s.name} as attachment (extension: {ext}, size: {sticker_size} bytes)")
-                    except Exception as e:
-                        logger.error(f"Failed to download sticker {getattr(s, 'name', 'unknown')}: {e}")
-                       # Check for existing mapping to avoid duplicates when resuming
+            # Content, attachments and stickers are built (and downloaded) by _process_and_send_message,
+            # after the mapping check, so already-migrated messages aren't downloaded again
+            # Check for existing mapping to avoid duplicates when resuming
             if context.state.get_target_message_id(target_channel_id, str(msg.id)):
                 continue
                 
@@ -738,11 +729,12 @@ async def migrate_messages(
                     thread_id=thread_id,
                     parent_target_id=parent_target_id,
                     thread_name=thread_name,
-                    processed_threads=processed_threads
+                    processed_threads=processed_threads,
+                    thread_target=thread_target
                 )
 
                 # Check for associated thread (Individual mode recursion)
-                if hasattr(msg, 'thread') and msg.thread:
+                if hasattr(msg, 'thread') and msg.thread and not _skip_archived(context, msg.thread):
                     thread = msg.thread
                     if thread.id not in processed_threads:
                         processed_threads.add(thread.id)
@@ -757,13 +749,14 @@ async def migrate_messages(
                             thread_id=str(thread.id),
                             parent_target_id=fluxer_msg_id,
                             thread_name=thread.name,
-                            processed_threads=processed_threads
+                            processed_threads=processed_threads,
+                            thread=thread
                         )
                         stats["messages"] += thread_stats["messages"]
                         stats["attachments"] += thread_stats["attachments"]
                         stats["threads"] += thread_stats["threads"]
                         
-                        if context.is_running:
+                        if context.is_running and not thread_stats.get("native_thread"):
                             await context.fluxer_writer.send_marker(
                                 channel_id=target_channel_id,
                                 content=f"> <<< END OF THREAD >>>"
@@ -785,6 +778,8 @@ async def migrate_messages(
         if thread_id and context.is_running:
             context.state.update_thread_completed(target_channel_id, thread_id, completed=True)
             logger.info(f"Thread '{thread_name}' (ID: {thread_id}) marked as completed.")
+            if thread_target and thread_target.get("id"):
+                await apply_thread_state(context, thread, thread_target["id"])
         
 
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -804,7 +799,8 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
     # However we just count them if the fetcher yields them.
     # Fetch global progress map to skip migrated messages efficiently
     progress_map = context.state.get_all_last_message_ids()
-    
+    seen_threads: set[str] = set()
+
     async for msg in context.discord_reader.fetch_global_message_history(after_id=after_message_id):
         if not context.is_running:
             break
@@ -812,16 +808,29 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
         # Determine target channel to check for existing mapping
         if not msg.channel:
             continue
-            
-        target_channel_id = context.state.get_target_channel_id(str(msg.channel.id))
-        if not target_channel_id:
-            continue
+        parent_src_id = _source_thread_parent_id(msg.channel)
+        if parent_src_id:
+            # Thread messages: counted like migrate_global_messages sends them (via the mapped parent;
+            # the thread itself may only get a target during migration)
+            if _skip_archived(context, msg.channel):
+                continue
+            target_channel_id = context.state.get_target_channel_id(parent_src_id)
+            if not target_channel_id:
+                continue
+            last_id = context.state.get_thread_last_message_id(target_channel_id, str(msg.channel.id))
+            if last_id and msg.id <= int(last_id):
+                continue
+        else:
+            target_channel_id = context.state.get_target_channel_id(str(msg.channel.id))
+            if not target_channel_id:
+                continue
 
-        # Efficient skip: if message ID is <= last migrated ID for this channel/thread
-        # This is the primary resume mechanism: wait until we pass the last migrated ID for this channel
-        last_id = progress_map.get(str(msg.channel.id))
-        if last_id and msg.id <= int(last_id):
-            continue
+            # Efficient skip: if message ID is <= last migrated ID for this channel/thread
+            # This is the primary resume mechanism: wait until we pass the last migrated ID for this channel.
+            # channel_tracking is keyed by the target channel ID (same lookup as migrate_global_messages)
+            last_id = progress_map.get(str(target_channel_id))
+            if last_id and msg.id <= int(last_id):
+                continue
             
         if msg.type not in [
             context.discord_reader.MESSAGE_TYPE_DEFAULT,
@@ -837,10 +846,12 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
             
         stats["messages"] += 1
         stats["attachments"] += len(msg.attachments)
-        if hasattr(msg, 'thread') and msg.thread:
-            # We don't recursively traverse here, we just count the fact there is a thread
-            # The actual thread messages are also fetched by the global fetcher because they have their own timestamp/id
-            stats["threads"] += 1
+        # Distinct threads, counted like migrate_global_messages: by a thread message or a starter message
+        if parent_src_id:
+            seen_threads.add(str(msg.channel.id))
+        elif getattr(msg, 'thread', None) and msg.id == msg.thread.id:
+            seen_threads.add(str(msg.thread.id))
+        stats["threads"] = len(seen_threads)
             
         if progress_callback and stats["messages"] % 100 == 0:
             await progress_callback(stats)
@@ -871,6 +882,7 @@ async def migrate_global_messages(
     }
     
     processed_threads = set()
+    thread_targets: Dict[str, Dict[str, Any] | None] = {}  # source thread ID -> Fluxer thread target
     logger.info("Starting Global Waterfall Migration for Fluxer...")
     
     # Fetch global progress map to skip migrated messages efficiently
@@ -897,7 +909,56 @@ async def migrate_global_messages(
             # Determine target channel
             if not msg.channel:
                 continue
-                
+
+            # Thread messages go into the Fluxer thread via its parent channel (which owns the webhook)
+            parent_src_id = _source_thread_parent_id(msg.channel)
+            if parent_src_id:
+                if _skip_archived(context, msg.channel):
+                    continue
+                target_channel_id = context.state.get_target_channel_id(parent_src_id)
+                if not target_channel_id:
+                    continue
+                src_thread_id = str(msg.channel.id)
+                last_id = context.state.get_thread_last_message_id(target_channel_id, src_thread_id)
+                if last_id and msg.id <= int(last_id):
+                    continue
+                if src_thread_id not in thread_targets:
+                    thread_targets[src_thread_id] = None
+                    try:
+                        # A thread started from a message (thread ID = starter message ID) is created from that
+                        # message once it's migrated, like migrate_messages does; else it's a standalone thread
+                        starter = context.state.get_target_message_id(target_channel_id, src_thread_id)
+                        _, target_thread_id, post_name = await resolve_target_thread(
+                            context, msg.channel, parent_message_id=str(starter) if starter else None)
+                        if target_thread_id or post_name:
+                            thread_targets[src_thread_id] = {"id": target_thread_id, "post_name": post_name, "thread": msg.channel}
+                    except Exception as e:
+                        logger.error(f"Could not create Fluxer thread for '{msg.channel.name}' ({src_thread_id}): {e}")
+                if thread_targets[src_thread_id] is None:
+                    continue
+                if src_thread_id not in processed_threads:
+                    processed_threads.add(src_thread_id)
+                    stats["threads"] += 1
+                try:
+                    await _process_and_send_message(
+                        context=context,
+                        msg=msg,
+                        target_channel_id=target_channel_id,
+                        stats=stats,
+                        thread_id=src_thread_id,
+                        thread_name=msg.channel.name,
+                        processed_threads=processed_threads,
+                        thread_target=thread_targets[src_thread_id]
+                    )
+                    if not stats["first_message_url"]:
+                        stats["first_message_url"] = msg.jump_url
+                    stats["last_message_url"] = msg.jump_url
+                    if progress_callback:
+                        await progress_callback(stats)
+                except Exception as e:
+                    logger.error(f"Failed to process global thread message {msg.id}: {e}")
+                continue
+
             target_channel_id = context.state.get_target_channel_id(str(msg.channel.id))
             if not target_channel_id:
                 continue
@@ -909,8 +970,9 @@ async def migrate_global_messages(
                 continue
                 
             # If it's a thread message, we need to handle it based on if it's the thread starter or a reply
-            if hasattr(msg, 'thread') and msg.thread and msg.id == msg.thread.id:
-                processed_threads.add(msg.thread.id)
+            # Count each thread once (thread messages above use the str ID too)
+            if getattr(msg, 'thread', None) and msg.id == msg.thread.id and str(msg.thread.id) not in processed_threads:
+                processed_threads.add(str(msg.thread.id))
                 stats["threads"] += 1
 
             try:
@@ -931,6 +993,12 @@ async def migrate_global_messages(
                     
             except Exception as e:
                 logger.error(f"Failed to process global message {msg.id}: {e}")
+
+        # Archive/lock threads like on Discord once all their messages are in
+        if context.is_running:
+            for target in thread_targets.values():
+                if target and target.get("id"):
+                    await apply_thread_state(context, target["thread"], target["id"])
                 
     except (KeyboardInterrupt, asyncio.CancelledError):
         context.is_running = False

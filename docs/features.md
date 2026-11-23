@@ -24,6 +24,8 @@ Here's complete list of everything the tool can handle and any specific caveats 
     - 🟧 **Slowmode** timing rules are preserved for text channels (Stoat doesnt have slowmode).
     - 🟩 **Bitrate** setting is also preserved Voice channels
     - 🟩 **Permission Overwrites**: Copies role-specific permission overwrites set on individual channels.
+* 🟩 **Fluxer: Renamed & Moved Channels**: Re-running Clone Server Template updates categories, channels and threads that were renamed, moved to another category or reordered on Discord since the last clone. The preview shows them in orange (already present ones in green). The order of forum/media channels within a category is not synced (Fluxer can't reorder them through its API).
+* 🟩 **Fluxer: Channels Deleted on Discord**: Categories, channels and threads that were migrated before and have since been deleted on Discord are shown in red in the Clone Server Template preview. After cloning, a separate confirmation asks whether to delete them on Fluxer as well (this also deletes their migrated messages). Channels that only exist on Fluxer are never touched.
 
 ## Roles
 *  🟩 **Role Cloning**: Clones every custom role with its original name, color (hex code), and hierarchical position.
@@ -67,8 +69,10 @@ Here's complete list of everything the tool can handle and any specific caveats 
 
 ### Threads & Forums
 * 🟩 **Active & Archived Threads**: Scans and migrates messages from all threads.
-* 🟧 **Thread Structure**: Maintains the nesting of threads within their parent channels.
-> This is a workaround as Threads and Forums are not yet implement in Fluxer and Stoat
+* 🟩 **Fluxer: Archived Threads Prompt**: Archived threads and forum posts are migrated too. Since that can take long on big servers, a popup asks after channel selection, only if the selected channels actually have archived threads, whether to run active threads only or active + archived threads. Skipped archived threads can be migrated in a later run.
+* 🟩 **Fluxer: Native Threads**: Threads are recreated as real threads under their parent channel, keeping the original authors. They are created during message migration (not while cloning the structure), at their place in the channel's history: a thread started from a message is created from that message, a standalone thread where its "thread created" notice was. Archived and locked threads are archived/locked again once their messages are migrated.
+* 🟧 **Fluxer: Forum Posts**: Forum posts are created as real posts with their first message during message migration (not while cloning the structure). Forum tags are not copied yet.
+* 🟧 **Stoat: Thread Structure**: Stoat has no threads, so thread messages are migrated into their parent channel between thread markers.
 
 ### Misc features
 * 🟩 **Incremental Sync**: Scans migration database to find the "Last Message ID." It skips duplicate data and continues where it left off.

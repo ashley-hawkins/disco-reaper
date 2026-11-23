@@ -10,6 +10,7 @@ import time
 import aiohttp
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union, List, Dict, Callable
 
 from textual.app import ComposeResult
@@ -21,9 +22,11 @@ from src.core.configuration import load_config
 from src.core.base import MigrationContext
 from src.core.audit import log_audit_event
 from src.core.exporter import DiscordExporter
+from src.core.structure import CATEGORY, CHANNEL, THREAD, build_structure_tree, render_structure_lines
+from src.core.channel_matching import match_channels, CATEGORY as CATEGORY_KIND, CHANNEL as CHANNEL_KIND
 from src.ui.modals import (
     ProgressScreen, SubMenuModal, ChannelPickerScreen, OptionSelectModal, MessageIDInputModal,
-    ChannelSelectScreen
+    ChannelSelectScreen, ArchivedThreadsModal, DeletedChannelsModal
 )
 
 import src.fluxer.roles_permissions as fluxer_roles
@@ -570,6 +573,34 @@ class OperationPane(Container):
 
         self._update_info_labels()
 
+    # ── archived threads ─────────────────────────────────────────────────
+
+    async def _choose_thread_scope(self, channels: list) -> bool | None:
+        """
+        Decides include_archived for a migration of these source channels: True if none of them
+        has archived threads (nothing to skip), otherwise the user's choice from a popup.
+        Returns None if the user cancelled.
+        """
+        reader = self.engine.discord_reader
+        archived = []
+        for c in channels:
+            try:
+                if await reader.has_archived_threads(c.id):
+                    archived.append(c)
+            except Exception as e:
+                logger.warning(f"Could not check archived threads of {getattr(c, 'name', c.id)}: {e}")
+        if not archived:
+            return True
+
+        choice_future = asyncio.get_running_loop().create_future()
+
+        def on_choice(choice: bool | None) -> None:
+            if not choice_future.done():
+                choice_future.set_result(choice)
+
+        self.app.push_screen(ArchivedThreadsModal([c.name for c in archived]), on_choice)
+        return await choice_future
+
     # ── button routing ────────────────────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -803,37 +834,27 @@ class OperationPane(Container):
                 modal.write("")
 
             if "structure" in preview:
-                structure = preview["structure"]
-                total_ch = sum(len(chans) for chans in structure.values())
-                num_cats = sum(1 for k in structure if k is not None)
-                modal.write(f"[bold cyan]Server Structure ({num_cats} Categories, {total_ch} Channels):[/bold cyan]")
-                
-                # Show uncategorized channels first at the top
-                if None in structure:
-                    _, _, uncat_channels = structure[None]
-                    for ch_name, ch_exists in uncat_channels:
-                        if ch_exists:
-                            modal.write(f"  - [green]# {ch_name}[/green]")
-                        else:
-                            modal.write(f"  - # {ch_name}")
-                
-                for cat_id, (cat_name, cat_exists, channels) in structure.items():
-                    if cat_id is None:
-                        continue  # already shown above
-                    cat_color = "green" if cat_exists else "bold yellow"
-                    modal.write(f"  [{cat_color}]📁 {cat_name}[/{cat_color}]")
-                    for ch_name, ch_exists in channels:
-                        if ch_exists:
-                            modal.write(f"    - [green]# {ch_name}[/green]")
-                        else:
-                            modal.write(f"    - # {ch_name}")
+                structure = preview["structure"]  # StructureNode tree (root)
+                n_deleted = sum(structure.count(kind, deleted=True) for kind in (CATEGORY, CHANNEL, THREAD))
+                modal.write(
+                    f"[bold cyan]Server Structure ({structure.count(CATEGORY)} Categories, "
+                    f"{structure.count(CHANNEL)} Channels, {structure.count(THREAD)} Threads"
+                    f"{f', {n_deleted} Deleted' if n_deleted else ''}):[/bold cyan]"
+                )
+                for line in render_structure_lines(structure):
+                    modal.write(line)
                 modal.write("")
 
             if connections_started:
                 # Add highlighting note
                 target_valid = await self.engine.writer.validate()
                 community_name = target_valid.get("community_name", "the target")
-                modal.write(f"[dim]Note: entities shown in 'green' are already present in {community_name} community[/dim]")
+                # No quotes around the color names: the log's highlighter would color quoted text green
+                modal.write(f"[dim]Note: entities shown in [/dim][green]green[/green][dim] are already present in "
+                            f"{community_name} community, [/dim][orange1]orange[/orange1][dim] ones were renamed "
+                            f"or moved and will be updated, [/dim][red]red[/red][dim] ones were deleted on Discord "
+                            f"and you will be asked before they are deleted on {community_name}. \n"
+                            f"Moving Forum Channels is currently not possible / inconsistent due to fluxer API.[/dim]")
                 modal.write("")
 
             choice = await modal.phase_wait_confirm(
@@ -870,6 +891,11 @@ class OperationPane(Container):
                     results["channels"] = await self._logic_clone_channels(modal, force=force_mode)
                 elif sel == "sub_sync_perms":
                     results["perms"] = await self._logic_sync_permissions(modal)
+
+            # Deleted on Discord since migrating: separate confirmation before deleting on the target
+            deleted = preview.get("deleted") or []
+            if deleted and "sub_clone_channels" in selections and self.engine.is_running:
+                results["deleted"] = await self._logic_delete_removed_channels(modal, deleted)
             
             modal.phase_report("Clone Template Complete", show_back=False)
             report = self._format_clone_report(results)
@@ -1107,6 +1133,33 @@ class OperationPane(Container):
             
         return "\n".join(lines)
 
+    async def _logic_delete_removed_channels(self, modal: ProgressScreen, items: list[dict]) -> int | None:
+        """Asks before deleting the target copies of channels deleted on Discord. Returns the count, None if kept."""
+        from src.fluxer.danger_zone import danger_delete_removed_channels
+        target_name = (await self.engine.writer.validate()).get("community_name") or "Fluxer"
+
+        choice_future = asyncio.get_running_loop().create_future()
+
+        def on_choice(choice: bool | None) -> None:
+            if not choice_future.done():
+                choice_future.set_result(bool(choice))
+
+        self.app.push_screen(DeletedChannelsModal(items, target_name), on_choice)
+        if not await choice_future:
+            modal.write(f"[dim]Kept {len(items)} channels/threads that were deleted on Discord.[/dim]")
+            return None
+
+        modal.set_item_status("[red]Deleting channels removed on Discord...")
+
+        async def on_deleted(name, current, total):
+            modal.set_item_status(f"[red]Deleting: {name}")
+            modal.set_progress(current, total)
+
+        count = await danger_delete_removed_channels(self.engine, items, progress_callback=on_deleted)
+        await log_audit_event(self.engine, "Clone: Deleted Channels Removed",
+                              f"Deleted {count} channels/threads that were deleted on Discord.")
+        return count
+
     def _format_clone_report(self, results: dict) -> str:
         lines = ["[bold green]Cloning Template Report[/bold green]\n"]
         
@@ -1129,7 +1182,18 @@ class OperationPane(Container):
                         lines.append(f"  - {ch}")
             lines.append("")
 
-        if not roles and not structure:
+        updated = channels.get("updated", [])
+        if updated:
+            lines.append(f"[bold cyan]Updated (renamed or moved) ({len(updated)}):[/bold cyan]")
+            for name in updated: lines.append(f"- {name}")
+            lines.append("")
+
+        removed = results.get("deleted")
+        if removed:
+            lines.append(f"[bold red]Deleted (removed on Discord): {removed}[/bold red]")
+            lines.append("")
+
+        if not roles and not structure and not updated and not removed:
             lines.append("[yellow]No items were cloned.[/yellow]")
 
         return "\n".join(lines)
@@ -1143,6 +1207,7 @@ class OperationPane(Container):
     async def _logic_autotest_migrate_all_channels(self, modal: ProgressScreen) -> None:
         """Automated name-based channel migration for Auto-Test."""
         migrate_mod = fluxer_migrate if self.target_platform == "fluxer" else stoat_migrate
+        self.engine.include_archived_threads = True  # Auto-Test always covers archived threads
         
         # 1. Matching
         modal.set_status("Auto-matching channels by name...")
@@ -1152,7 +1217,8 @@ class OperationPane(Container):
         d_channels = await self.engine.discord_reader.get_channels()
         text_channels = [c for c in d_channels if c.type in [
             self.engine.discord_reader.CHANNEL_TYPE_TEXT, 
-            self.engine.discord_reader.CHANNEL_TYPE_NEWS
+            self.engine.discord_reader.CHANNEL_TYPE_NEWS,
+            self.engine.discord_reader.CHANNEL_TYPE_FORUM
         ]]
         
         modal.write(f"[bold cyan]Auto-Test: Found {len(text_channels)} channels to migrate.[/bold cyan]")
@@ -1215,9 +1281,11 @@ class OperationPane(Container):
             # If reading from backup, only show channels that have actual message backup data
             if getattr(self.engine, "source_mode", "live") == "backup" and hasattr(self.engine.discord_reader, "get_backed_up_channel_ids"):
                 valid_ids = await self.engine.discord_reader.get_backed_up_channel_ids()
-                full_d = [c for c in full_d if c.id in valid_ids]
+                # Forum messages are stored under their posts (threads), not the forum itself
+                post_parents = {t.parent_id for t in getattr(self.engine.discord_reader, "threads", []) if t.id in valid_ids}
+                full_d = [c for c in full_d if c.id in valid_ids or c.id in post_parents]
                 
-            d_channels = [c for c in full_d if c.type in [self.engine.discord_reader.CHANNEL_TYPE_TEXT, self.engine.discord_reader.CHANNEL_TYPE_NEWS]]
+            d_channels = [c for c in full_d if c.type in [self.engine.discord_reader.CHANNEL_TYPE_TEXT, self.engine.discord_reader.CHANNEL_TYPE_NEWS, self.engine.discord_reader.CHANNEL_TYPE_FORUM]]
             d_cats = await self.engine.discord_reader.get_categories()
             d_cat_map = {c.id: c.name for c in d_cats}
 
@@ -1280,6 +1348,12 @@ class OperationPane(Container):
                     src_id, tgt_id = res
                     source_channel = next(c for c in d_channels if c.id == src_id)
                     target_channel = next(c for c in f_channels if c.get("id") == tgt_id)
+
+                # Archived threads: ask only if the selected channel has any
+                include_archived = await self._choose_thread_scope([source_channel])
+                if include_archived is None:
+                    continue  # Cancel returns to the channel picker
+                self.engine.include_archived_threads = include_archived
 
                 # 2. Analyze
                 modal = ProgressScreen(log_level=self.config.log_level)
@@ -1694,53 +1768,36 @@ class OperationPane(Container):
                     # Skip missing channels: remove them from the active list
                     missing_ids = {str(c.id) for c in missing_channels}
                     d_channels = [c for c in d_channels if str(c.id) not in missing_ids]
+
+            # Archived threads: ask only if the migrated channels (incl. forums) have any
+            if is_autotest:
+                include_archived = True
+            else:
+                scope_channels = [c for c in d_channels if c.type != 4] + [c for c in full_d if c.type in (15, 16)]
+                include_archived = await self._choose_thread_scope(scope_channels)
+            if include_archived is None:
+                modal.dismiss()
+                await self.engine.close_connections()
+                return
+            self.engine.include_archived_threads = include_archived
             
-            # 2. Resumption check
-            all_mapped_tgt_ids = []
-            # Check regular text channels (exclude categories for resume check)
-            for c in d_channels:
-                if c.type == 4: continue
-                did = str(c.id)
-                tid = self.engine.state.get_target_channel_id(did)
-                if tid: all_mapped_tgt_ids.append(tid)
-            
-            # Also check threads (filtering to only include those belonging to active channels)
+            # 2. Resume point (state.waterfall_resume_point): mapped channels and threads of the migrated
+            # channels; in backup mode only those with backed-up messages (an empty one would stay at 0).
+            state = self.engine.state
             active_channel_ids = {str(c.id) for c in d_channels}
-            if hasattr(self.engine.discord_reader, "get_active_threads"):
-                threads = await self.engine.discord_reader.get_active_threads()
-                for t in threads:
-                    pid = str(getattr(t, 'parent_id', getattr(t, 'channel_id', None)))
-                    if pid not in active_channel_ids: continue
-                    tid = self.engine.state.get_target_channel_id(str(t.id))
-                    if tid: all_mapped_tgt_ids.append(tid)
-            
-            # 2.5 Filter by actual content (Only for BackupReader)
-            # If a channel has NO messages in the backup, it will always be at 0 progress.
-            # We exclude those from the global MIN calculation to avoid pulling it to 0.
+            resume_channels = d_channels
             if hasattr(self.engine.discord_reader, "get_backed_up_channel_ids"):
-                backed_up_src_ids = await self.engine.discord_reader.get_backed_up_channel_ids()
-                backed_up_src_ids_str = {str(sid) for sid in backed_up_src_ids}
-                
-                filtered_tgt_ids = []
-                # Find which target IDs belong to source channels that HAVE messages
-                for c in d_channels: # (d_channels is already filtered for skipped)
-                    if str(c.id) in backed_up_src_ids_str:
-                        tid = self.engine.state.get_target_channel_id(str(c.id))
-                        if tid: filtered_tgt_ids.append(tid)
-                
-                # Also check threads
-                if hasattr(self.engine.discord_reader, "threads"):
-                    for t in self.engine.discord_reader.threads:
-                        if str(t.id) in backed_up_src_ids_str:
-                            tid = self.engine.state.get_target_channel_id(str(t.id))
-                            if tid: filtered_tgt_ids.append(tid)
-                
-                if filtered_tgt_ids:
-                    all_mapped_tgt_ids = filtered_tgt_ids
-                
-            # 2.6 Resume Point: Calculate from global channel minimums
-            min_last_id = self.engine.state.get_global_min_last_message_id(all_mapped_tgt_ids)
-            
+                backed_up = {str(sid) for sid in await self.engine.discord_reader.get_backed_up_channel_ids()}
+                resume_channels = [c for c in d_channels if str(c.id) in backed_up] or d_channels
+                # All backed-up threads incl. forum posts and archived ones (an unmigrated one only bounds
+                # the resume point by its own ID, see waterfall_resume_point)
+                resume_threads = [t for t in getattr(self.engine.discord_reader, "threads", [])
+                                  if str(t.id) in backed_up]
+            else:
+                resume_threads = [t for t in await self.engine.discord_reader.get_active_threads()
+                                  if str(getattr(t, 'parent_id', None)) in active_channel_ids]
+            min_last_id = state.waterfall_resume_point(resume_channels, resume_threads)
+
             modal.write(f"\n[bold cyan]Waterfall Migration Resume Point:[/bold cyan]")
             if min_last_id is not None:
                 modal.write(f"Minimum unmigrated message ID found: [green]{min_last_id}[/green]")
@@ -2024,15 +2081,12 @@ class OperationPane(Container):
 
         return preview
 
-    async def _fetch_clone_preview(self, selections: list[str]) -> dict[str, Any]:
-        """Fetches preview data from Discord (source server) for cloning confirmation,
-        comparing with existing entities on the target server for presence highlighting."""
     async def _perform_auto_matching(self):
         """Matches Discord entities (roles, channels, emojis, stickers) with target platform items by name."""
         if not self.engine:
             return
         
-        reader = self.engine.discord_reader
+        reader = self.engine.sync_reader
         writer = self.engine.writer
         is_fluxer = self.target_platform == "fluxer"
 
@@ -2085,22 +2139,11 @@ class OperationPane(Container):
 
         # 1.5 Cleanup deleted entities from mapping database
         # This prevents "Ghost" mappings to channels/roles that were deleted on target
-        valid_chan_ids = {str(c.get("id")) for c in target_chans_raw}
-        valid_cat_ids = {str(c.get("id")) for c in target_chans_raw if c.get("type") == 4}
         valid_role_ids = set(target_roles_map.values())
         valid_emoji_ids = set(target_emojis_map.values())
 
-        # Channels
-        for src_id, tgt_id in self.engine.state.channel_map.items():
-            if str(tgt_id) not in valid_chan_ids:
-                logger.info(f"Auto-matching: clearing deleted channel mapping {src_id} -> {tgt_id}")
-                self.engine.state.remove_target_channel_mapping(src_id)
-
-        # Categories
-        for src_id, tgt_id in self.engine.state.category_map.items():
-            if str(tgt_id) not in valid_cat_ids:
-                logger.info(f"Auto-matching: clearing deleted category mapping {src_id} -> {tgt_id}")
-                self.engine.state.remove_category_mapping(src_id)
+        # Channels and categories are checked in match_channels below (channel_mappings first).
+        # Thread mappings aren't in the target channel list, so they are left alone here.
 
         # Roles
         for src_id, tgt_id in self.engine.state.role_map.items():
@@ -2126,21 +2169,14 @@ class OperationPane(Container):
                     logger.info(f"Auto-matched Role: {r.name} -> {target_roles_map[name_l]}")
                     self.engine.state.set_target_role_mapping(r.id, target_roles_map[name_l])
             
-            # Categories
+            # Categories and channels: channel_mappings first, name matching only for unknown ones
             src_cats = await reader.get_categories()
-            for cat in src_cats:
-                name_l = cat.name.lower()
-                if name_l in target_cats_map and not self.engine.state.get_target_category_id(cat.id):
-                    logger.info(f"Auto-matched Category: {cat.name} -> {target_cats_map[name_l]}")
-                    self.engine.state.set_target_category_mapping(cat.id, target_cats_map[name_l])
-            
-            # Channels
             src_channels = await reader.get_channels()
-            for ch in src_channels:
-                name_l = ch.name.lower()
-                if name_l in target_chans_map and not self.engine.state.get_target_channel_id(ch.id):
-                    logger.info(f"Auto-matched Channel: {ch.name} -> {target_chans_map[name_l]}")
-                    self.engine.state.set_target_channel_mapping(ch.id, target_chans_map[name_l])
+            self.engine.state.record_source_channels([*src_cats, *src_channels])
+            match_channels(self.engine.state, src_cats,
+                           [c for c in target_chans_raw if c.get("type") == 4], kind=CATEGORY_KIND)
+            match_channels(self.engine.state, src_channels,
+                           [c for c in target_chans_raw if c.get("type") != 4], kind=CHANNEL_KIND)
             
             # Emojis
             src_emojis = await reader.get_emojis()
@@ -2174,12 +2210,13 @@ class OperationPane(Container):
         """Fetches preview data from Discord (source server) for cloning confirmation,
         comparing with existing mappings in SQLite for presence highlighting."""
         preview = {}
-        reader = self.engine.discord_reader
+        reader = self.engine.sync_reader
         
-        # We rely on the global auto-match that ran during connection
-        mapping_ch = self.engine.state.channel_map
-        mapping_cat = self.engine.state.category_map
-        mapping_role = self.engine.state.role_map
+        # We rely on the global auto-match that ran during connection.
+        # Mapping keys are int on Fluxer and str on Stoat, so compare as str.
+        mapping_ch = {str(k) for k in self.engine.state.channel_map}
+        mapping_cat = {str(k) for k in self.engine.state.category_map}
+        mapping_role = {str(k) for k in self.engine.state.role_map}
 
         try:
             if "sub_clone_roles" in selections:
@@ -2193,23 +2230,48 @@ class OperationPane(Container):
             if "sub_clone_channels" in selections:
                 src_categories = await reader.get_categories()
                 src_channels = await reader.get_channels()
-                
-                # Build hierarchy for preview
-                structure = {}
-                for cat in src_categories:
-                    cat_exists = str(cat.id) in mapping_cat
-                    structure[cat.id] = (cat.name, cat_exists, [])
-                
-                for ch in src_channels:
-                    ch_exists = str(ch.id) in mapping_ch
-                    if ch.category_id in structure:
-                        structure[ch.category_id][2].append((ch.name, ch_exists))
-                    else:
-                        if None not in structure:
-                            structure[None] = ("No Category", False, [])
-                        structure[None][2].append((ch.name, ch_exists))
-                
-                preview["structure"] = structure
+                try:
+                    # Archived too: renamed archived threads are updated, and thread/post counts must be complete
+                    src_threads = await reader.get_threads(True)
+                except Exception as e:
+                    logger.warning(f"Clone Preview: failed to fetch threads: {e}")
+                    src_threads = []
+
+                def is_mapped(kind: str, item_id) -> bool:
+                    return str(item_id) in (mapping_cat if kind == CATEGORY else mapping_ch)
+
+                # Renamed/moved on Discord since cloning: shown orange, the clone edits them on the target.
+                # Deleted on Discord after migrating: shown red, deleted on the target only after a confirmation.
+                changed: set[str] = set()
+                deleted: list[dict] = []
+                if self.target_platform == "fluxer":
+                    from src.fluxer.clone_server import find_changed_channels, find_deleted_channels
+                    try:
+                        changed = await find_changed_channels(self.engine, src_categories, src_channels, src_threads)
+                    except Exception as e:
+                        logger.warning(f"Clone Preview: could not check for renamed/moved channels: {e}")
+                    try:
+                        deleted = await find_deleted_channels(self.engine, src_categories, src_channels, src_threads)
+                    except Exception as e:
+                        logger.warning(f"Clone Preview: could not check for deleted channels: {e}")
+                preview["deleted"] = deleted
+                deleted_ids = {d["discord_id"] for d in deleted}
+
+                def stand_in(d: dict) -> SimpleNamespace:
+                    """Tree item for a deleted channel, placed under its last known parent."""
+                    as_id = lambda v: int(v) if v not in (None, "") else None
+                    return SimpleNamespace(id=int(d["discord_id"]), name=d["name"], type=d["type"],
+                                           position=d["position"], category_id=as_id(d["category_id"]),
+                                           parent_id=as_id(d["parent_id"]))
+
+                gone = {kind: [stand_in(d) for d in deleted if d["kind"] == kind] for kind in ("category", "channel", "thread")}
+
+                # Recursive tree: categories > channels > threads
+                preview["structure"] = build_structure_tree(
+                    [*src_categories, *gone["category"]], [*src_channels, *gone["channel"]],
+                    [*src_threads, *gone["thread"]], is_mapped,
+                    is_changed=lambda kind, item_id: str(item_id) in changed,
+                    is_deleted=lambda kind, item_id: str(item_id) in deleted_ids)
         except Exception as e:
             logger.warning(f"Clone Preview: failed to fetch structure: {e}")
         
