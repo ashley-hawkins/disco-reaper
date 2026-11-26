@@ -218,12 +218,16 @@ class DiscordReader:
         categories = await self._fetch_guild_channels()
         return [c for c in categories if isinstance(c, discord.CategoryChannel)]
 
-    async def get_roles(self):
-        """Returns all roles in the server (excluding @everyone)."""
+    async def get_roles(self, include_default: bool = False):
+        """Returns all roles in the server.
+
+        @everyone is excluded unless include_default is set; only the backup
+        exporter asks for it, so migration code never sees it.
+        """
         if not self.guild:
             return []
         roles = await self.guild.fetch_roles()
-        return [r for r in roles if not r.is_default()]
+        return [r for r in roles if include_default or not r.is_default()]
 
     async def get_emojis(self):
         """Returns all custom emojis in the server."""

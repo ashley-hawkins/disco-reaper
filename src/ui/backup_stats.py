@@ -323,7 +323,7 @@ class BackupStatsScreen(Screen[None]):
             member_count = len(reader.members)
             emoji_count = len(reader.emojis)
             sticker_count = len(reader.stickers)
-            role_count = len(reader.roles)
+            role_count = len([r for r in reader.roles if not r.is_default()])
 
             self.query_one("#bs_val_members", Label).update(f"{member_count}")
             self.query_one("#bs_val_roles", Label).update(f"{role_count}")

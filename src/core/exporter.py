@@ -135,8 +135,13 @@ class DiscordExporter:
         return metadata
 
     async def export_roles(self):
-        """Exports all roles to the SQLite database."""
-        roles = await self.reader.get_roles()
+        """Exports all roles, including @everyone, to the SQLite database.
+
+        @everyone is stored (its id is the guild id) so a restore can recreate
+        the server's default permissions. The returned list leaves it out so
+        callers keep counting only the roles members can actually hold.
+        """
+        roles = await self.reader.get_roles(include_default=True)
         role_data = []
         for r in roles:
             role_data.append({
@@ -153,7 +158,7 @@ class DiscordExporter:
         
         if self.db:
             self.db.save_roles(role_data)
-        return role_data
+        return [r for r in role_data if r["name"] != "@everyone"]
 
     async def download_server_assets(self):
         """Downloads server icon and banner to server_assets folder."""

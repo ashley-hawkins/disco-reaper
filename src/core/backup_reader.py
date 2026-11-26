@@ -1365,8 +1365,8 @@ class BackupReader:
 
     # ── roles, emojis, stickers, members ─────────────────────────────────
 
-    async def get_roles(self) -> List[BackupRole]:
-        return [r for r in self.roles if not r.is_default()]
+    async def get_roles(self, include_default: bool = False) -> List[BackupRole]:
+        return [r for r in self.roles if include_default or not r.is_default()]
 
     async def get_emojis(self) -> List[BackupEmoji]:
         return list(self.emojis)
